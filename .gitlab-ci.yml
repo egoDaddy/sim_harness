@@ -124,10 +124,21 @@ sim:smoke:
       # (缺 /api/operation_mode/change_to_autonomous) -> 注入链 wait_for_ready
       # 卡满超时 -> 无 set_route/无 engage -> ego 不动 -> 全 criteria FAILURE.
       for pat in "$AUTOWARE_WS/install" 'e2e_simulator.launch.xml' \
-                 'autoware_srunner_launch.py' 'scenario_monitor' \
-                 'carla_ros_scenario_runner' 'npc_marker_publisher' \
-                 'rclcpp_components/component_container' 'rviz2'; do
+                 'autoware_srunner_launch.py' 'lib/autoware_srunner/scenario_monitor' \
+                 'carla_ros_scenario_runner' 'lib/autoware_srunner/npc_marker_publisher' \
+                 'rclcpp_components/component_container' 'rviz2' \
+                 'scenario_runner-0.9.16/scenario_runner.py'; do
         pgrep -f "$pat" | xargs -r kill -9 2>/dev/null || true
+      done
+      # scenario_runner.py 是 carla_ros_scenario_runner 的子进程, wrapper 被 SIGINT
+      # 后会孤儿化并继续持有 Traffic Manager 的 RPC 端口 (8000 起), 使下一轮场景在
+      # "trying to create rpc server for traffic manager" 处直接 ERROR。
+      for port in 8000 8001 8002 8003; do
+        tpid=$(ss -ltnp 2>/dev/null | grep ":$port " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+        if [ -n "$tpid" ]; then
+          echo "  释放 :$port (pid $tpid)"
+          kill -9 "$tpid" 2>/dev/null || true
+        fi
       done
       sleep 2
       # FastDDS 共享内存段残留会占满端口 (open_and_lock_file failed) 并污染发现
