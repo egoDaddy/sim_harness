@@ -118,6 +118,22 @@ sim:smoke:
       grep -nE '^ +rviz:' "$CI_CFG"
       grep -qE '^ {4}rviz: false' "$CI_CFG" || { echo "FAIL: rviz 未改成 false"; exit 1; }
     - |
+      echo "== [0b/4] 进程清场: 杀上一轮残留的 e2e / autoware / scenario_runner =="
+      # 残留 e2e 会持续提供 /api/routing/set_route_points, 使 monitor 的
+      # _routing_service_ready() 误判 "e2e ready" 而秒开跑; 而残留集群不完整
+      # (缺 /api/operation_mode/change_to_autonomous) -> 注入链 wait_for_ready
+      # 卡满超时 -> 无 set_route/无 engage -> ego 不动 -> 全 criteria FAILURE.
+      for pat in "$AUTOWARE_WS/install" 'e2e_simulator.launch.xml' \
+                 'autoware_srunner_launch.py' 'scenario_monitor' \
+                 'carla_ros_scenario_runner' 'npc_marker_publisher' \
+                 'rclcpp_components/component_container' 'rviz2'; do
+        pgrep -f "$pat" | xargs -r kill -9 2>/dev/null || true
+      done
+      sleep 2
+      # FastDDS 共享内存段残留会占满端口 (open_and_lock_file failed) 并污染发现
+      rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps* 2>/dev/null || true
+      echo "  剩余 e2e 进程: $(pgrep -f 'e2e_simulator.launch.xml' | wc -l)"
+    - |
       echo "== [0/4] 清场: 先销毁上一轮残留 actor, 再跑 (否则重复 ego / 孤儿传感器) =="
       env PYTHONPATH="$CARLA_PY:${PYTHONPATH:-}" LD_PRELOAD="$CARLA_CUDART" \
         install/autoware_srunner/lib/autoware_srunner/destroy_actors \
