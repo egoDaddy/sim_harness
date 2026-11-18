@@ -27,7 +27,7 @@ variables:
   CARLA_CUDART: "/usr/local/cuda/lib64/libcudart.so"
   # pipeline 产物落在 CI_PROJECT_DIR 内, artifacts 才能被 runner 收集
   CI_OUT: "$CI_PROJECT_DIR/ci_out"
-  SIM_TIMEOUT: "2400"          # 40 min 墙钟兜底 (job timeout 之外的第二道闸)
+  SIM_TIMEOUT: "1800"          # 30 min 墙钟兜底 (run_summary 落盘会提前结束)
 
 default:
   tags: [carla-sim]            # 只匹配仿真机上的 shell runner (docker1 不接)
@@ -154,8 +154,12 @@ sim:smoke:
       env PYTHONPATH="$CARLA_PY:${PYTHONPATH:-}" LD_PRELOAD="$CARLA_CUDART" \
         python3 -c "import carla;c=carla.Client('localhost',2000);c.set_timeout(5);print('CARLA server', c.get_server_version())"
     - |
-      echo "== [2/4] 跑批 (timeout 发 INT 让 launch 走 shutdown 收尾) =="
-      timeout --signal=INT --kill-after=120 "$SIM_TIMEOUT" \
+      echo "== [2/4] 跑批 (setsid 独立进程组; 收尾强制收组) =="
+      # monitor 退出后 ros2 launch 常因某个子节点不响应 SIGINT 而卡住不返回,
+      # 让 job 一直挂到超时 (实测挂过 10 min+ 直到人工 kill), 故用 setsid 建组
+      # 并在 run_summary 落盘后 / 墙钟到期时按进程组强杀收尾。
+      WALL=$((SIM_TIMEOUT + 180))
+      setsid timeout --signal=INT --kill-after=120 "$WALL" \
         ros2 launch autoware_srunner autoware_srunner_launch.py \
           asr_config:="$CI_OUT/asr_ci.yaml" \
           scenario_root:="$ASR_WS/scenarios" \
@@ -163,7 +167,22 @@ sim:smoke:
           results_dir:="$CI_OUT/sim" \
           xosc_list:="${XOSC_LIST:-xosc_list.json}" \
           orchestration:=auto \
-        > "$CI_OUT/sim/launch.log" 2>&1 || true
+        > "$CI_OUT/sim/launch.log" 2>&1 &
+      LPID=$!
+      WAITED=0
+      while kill -0 "$LPID" 2>/dev/null; do
+        if [ -f "$CI_OUT/sim/run_summary.json" ]; then
+          echo "  run_summary 已落盘, 3s 后收组"
+          sleep 3; break
+        fi
+        if [ "$WAITED" -ge "$WALL" ]; then echo "  墙钟到期, 强制收组"; break; fi
+        sleep 2; WAITED=$((WAITED + 2))
+      done
+      kill -TERM -"$LPID" 2>/dev/null || true
+      sleep 5
+      kill -KILL -"$LPID" 2>/dev/null || true
+      wait "$LPID" 2>/dev/null || true
+      echo "  编排器已收组 (launch.log $(wc -l < "$CI_OUT/sim/launch.log" 2>/dev/null || echo 0) 行)"
     - |
       echo "== [3/4] 判定 (唯一可信来源 = run_summary.json) =="
       python3 src/autoware_srunner/ci/judge_run_summary.py \
