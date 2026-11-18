@@ -1,0 +1,181 @@
+# ============================================================================
+# autoware_srunner 联合仿真主配置 (tick 主从反转架构)
+#
+# 世界配置归属:
+#   - CARLA 服务器: 外部常驻 (本工程不启停); 世界由 scenario_runner 负责加载 (Town01)
+#   - CARLA tick 主: scenario_runner (--sync 同步模式 + 节流);
+#     autoware_carla_interface 完全被动 (禁 spawn/tick, wait_for_tick 阻塞消费)
+#   - ego 车辆: scenario_runner 按 xosc Init TeleportAction 生成并销毁 (role_name=ego_role_name)
+#   - ego 传感器: autoware_carla_interface 安装 (120s 窗口轮询附着 scenario_runner spawn 的 ego)
+#   - NPC: scenario_runner 按 xosc 生成/驱动/销毁 (场景结束自清理)
+#   - ROS map: /home/xuhua/autoware_map/Town01 (xodr 右手系)
+#
+# role_name 单一源头: 顶层 ego_role_name 同时用于
+#   1. scenario_runner bridge 的 role_name 参数 (绑定 xosc ScenarioObject name)
+#   2. e2e 的 ego_vehicle_role_name 参数 (interface 附着轮询)
+#   3. gen_accel_xosc.py 的 --role-name (xosc 生成期写入 ScenarioObject name)
+# ============================================================================
+
+workspace:
+  root: "/home/carla_disk/carla_project/autoware_srunner_ws"
+  
+# 资产根 (多仓分离边界): harness 只通过这三个根访问外部数据,
+# 默认值等于改造前位置 -> 行为零变化; CI 用 CLI 参数覆盖为场景库 checkout 路径
+paths:
+  scenario_root: "/home/carla_disk/carla_project/autoware_srunner_ws/scenarios"
+  fault_root:    "/home/carla_disk/carla_project/autoware_srunner_ws/fault"
+  results_root:  "/home/carla_disk/carla_project/autoware_srunner_ws/scenarios/results"
+  # 被测物(autoware)侧 sensor_mapping*.yaml 目录: 仅契约校验 C4 读取, 运行时不依赖
+  sensor_mapping_dir: "/home/xuhua/autoware/src/universe/autoware_universe/simulator/autoware_carla_interface/config"
+
+# ego role_name 单一源头 (yaml/xosc/interface 三侧一致, 见头部注释)
+ego_role_name: "ego_vehicle"
+
+environment:
+  # CARLA python 依赖: agents 包 + carla wheel (carla_ros_scenario_runner / 本包节点 import carla 需要)
+  pythonpath_extra:
+    - "/home/carla_disk/carla/PythonAPI/carla"
+    - "/home/xuhua/anaconda3/envs/carla_py310/lib/python3.10/site-packages"
+  # CARLA python 库需 cudart (与 e2e 笔记一致)
+  ld_preload: "/usr/local/cuda/lib64/libcudart.so"
+  autoware_install: "/home/xuhua/autoware/install"
+  carla_bridge_install: "/home/carla_disk/carla_ros_bridge/catkin_ws/install"
+  srunner_install: "/home/carla_disk/carla_project/autoware_srunner_ws/install"
+
+# ---------------- autoware e2e (e2e_simulator.launch.xml 参数) ----------------
+autoware:
+  launch_package: "autoware_launch"
+  launch_file: "e2e_simulator.launch.xml"
+  map_path: "/home/xuhua/autoware_map/Town01"
+  vehicle_model: "sample_vehicle"
+  sensor_model: "carla_sensor_kit"
+  simulator_type: "carla"
+  # ego 生成位姿/车型/颜色已移交 scenario_runner (xosc Init TeleportAction + Vehicle 声明),
+  # interface 不再 spawn ego (spawn_point/carla_ego_vehicle_type/color 已废弃)
+  attach_timeout_s: 120.0                      # interface 附着 ego 轮询窗口 (超时退出并关闭 autoware)
+  use_light_weight_sensor_mapping: true
+  perception_mode: "lidar"
+  rviz: true                                    # RViz 展示 /carla/npc_markers (autoware.rviz 已加 NpcMarkers)
+  use_sim_time: true
+
+# ---------------- scenario_runner (carla_ros_scenario_runner) ----------------
+scenario_runner:
+  package: "carla_ros_scenario_runner"
+  executable: "carla_ros_scenario_runner"
+  scenario_runner_path: "/home/carla_disk/scenario_runner-0.9.16"
+  host: "localhost"
+  port: 2000
+  wait_for_ego: false                           # scenario_runner 按 xosc Init TeleportAction 生成 ego
+                                                # (生成/销毁/注册全在 scenario_runner 池内);
+                                                # role_name 取自顶层 ego_role_name (单一源头)
+  # 调试用单场景入口: 相对 paths.scenario_root (禁止写绝对路径, 否则拆仓即断)
+  scenario_name: "npc_accel_multistep"
+  scenario_file: "npc/npc_accel_multistep.xosc"
+  execute_delay_s: 8.0                          # execute_scenario 请求延迟; 不再承担 ego spawn 对齐职责
+                                                # (ego spawn 与 NPC teleport 在同一次请求内原子完成),
+                                                # 仅给 CARLA world 就绪留余量, 取值宽松
+  sync_flag_override: true                      # -> 环境变量 SCENARIO_RUNNER_SYNC_FLAG=true:
+                                                # scenario_runner 成为 tick 主 (bridge 据其追加 --sync)
+
+# ---------------- ego 注入链 (set_route -> trajectory_publisher) ----------------
+# 注入链由 scenario_monitor 编排器每场景拉起 (循环执行模式); 轨迹文件不再用
+# trajectory_file 指定, 改为 trajectory_publisher 用 --xosc 解析当前场景 xosc 中
+# 的 ego_trajectory_ref 声明加载同名 json (需求 2/3)
+ego_injection:
+  set_route_goal: "334.8,-238.8"                # ROS map 右手系 (trajectory.json 终点)
+  set_route_goal_yaw_deg: -90.0                 # 南行车道朝向
+  nudge_back_m: 6.0
+  rate: 10.0
+  use_sim_time: true
+  trajectory_topic: "/planning/scenario_planning/lane_driving/motion_planning/path_optimizer/trajectory"
+  # controller 直注 (恢复): trajectory_publisher 直接注入 controller 输入, 绕过
+  # motion_velocity_planner 避障 (测 AEB 介入); 若置空则关闭直注走完整避障链路
+  controller_topic: "/planning/scenario_planning/velocity_smoother/trajectory"
+  # controller 加速上限覆盖: 每场景新 autoware 参数复位为 3.0, 编排器后台等待
+  # controller_node_exe 上线后覆盖为 6.0 (对齐 model3 实测 ~6.4 m/s^2);
+  # 置空/0 则跳过覆盖
+  max_acc_override: 6.0
+  # 触发信号 (npc_ready_trigger 发布, latch): set_route/trajectory_publisher 的前置条件
+  ready_topic: "/carla/srunner/npc_ready"
+  wait_timeout_s: 300.0
+  wait_services:                               # 同时等待这些服务就绪, 保证 set_route 一次成功
+    - "/api/routing/set_route_points"
+    - "/api/operation_mode/change_to_autonomous"
+
+# ---------------- NPC 就位触发 (需求 3c) ----------------
+npc_ready_trigger:
+  status_topic: "/scenario_runner/status"
+  ready_topic: "/carla/srunner/npc_ready"
+  poll_rate_hz: 5.0        # NPC 就位检测提速 (2Hz->5Hz, 缩短 ego 起步延迟)
+  host: "localhost"
+  port: 2000
+  ego_role_names: ["ego_vehicle", "hero", "ego"]
+  cycle_topic: "/carla/srunner/cycle"           # 编排器循环信号 (reset 复位触发状态)
+
+# ---------------- auto ready 门控触发 (方案 A) ----------------
+auto_ready_trigger:
+  engage_topic: "/autoware/engage"              # 备选判据: engage=true 即开闸 (部分集成由 rviz 手动)
+  mode_state_topic: "/system/operation_mode/state"  # 主判据: AUTONOMOUS 且 control enabled 即开闸
+  ready_topic: "/carla/srunner/auto_ready"      # 观测信号 (latch)
+  flag_dir: "/tmp/srunner/flags"                # 与 scenario_runner SRUNNER_FLAG_DIR 一致 (WaitForFileFlag 轮询)
+  cycle_topic: "/carla/srunner/cycle"           # 编排器循环信号 (reset 清 flag + e2e_up 恢复监听)
+
+# ---------------- NPC marker 发布 (需求 4) ----------------
+npc_markers:
+  host: "localhost"
+  port: 2000
+  rate_hz: 10.0
+  topic: "/carla/npc_markers"
+  frame_id: "map"
+  ego_role_names: ["ego_vehicle", "hero", "ego"]
+  # NPC 颜色与 ego 区分: 车辆橙色, 行人绿色
+  vehicle_color: [1.0, 0.45, 0.10, 0.90]
+  vehicle_window_color: [0.10, 0.14, 0.20, 0.95]
+  vehicle_light_color: [1.0, 0.95, 0.60, 1.0]
+  wheel_color: [0.08, 0.08, 0.08, 1.0]
+  walker_color: [0.25, 0.85, 0.35, 0.90]
+
+# ---------------- metrics 采集 (collision_speed_kph 等) ----------------
+metrics:
+  host: "localhost"
+  port: 2000
+  poll_rate_hz: 2.0          # ego 轮询/碰撞传感器挂载检测频率 (wall-clock, 不依赖 /clock)
+  cycle_topic: "/carla/srunner/cycle"           # 编排器循环信号 (reset 清空本场景指标)
+  metrics_topic: "/carla/srunner/metrics"       # metrics JSON 发布 (latch, monitor 读取并入 summary)
+
+# ---------------- 生命周期 (需求 3d) + 循环编排 (scenario_monitor 编排器) ----------------
+lifecycle:
+  auto_shutdown: true                  # 全部场景完成后编排器退出 -> 关闭整个 launch (e2e 一并关闭)
+  status_topic: "/scenario_runner/status"
+  host: "localhost"
+  port: 2000
+  # ---- 循环编排 (循环执行模式, 需求 1/4/5/6/7) ----
+  cycle:
+    # 需要执行的 xosc 列表 (需求 4): [{name, file}] 依次执行, 每场景 autoware relaunch
+    xosc_list: "xosc_list.json"        # 相对 paths.scenario_root (禁止写绝对路径)
+    # 故障注入矩阵 (可选): 非空时以矩阵条目驱动场景 (条目 scenario 字段), 否则 xosc_list
+    fault_matrix: ""
+    scenario_finished_topic: "/scenario_runner/scenario_finished"   # 逐场景完成状态通道 (需求 6)
+    batch_service: "/carla/srunner/execute_batch"   # manual 模式指令服务 (monitor 常驻按需入队)
+    cycle_topic: "/carla/srunner/cycle"             # 编排信号 (reset / e2e_up, 触发器消费)
+    e2e_ready_wait_s: 180.0        # 等待 e2e 路由服务就绪超时
+    e2e_shutdown_wait_s: 60.0      # SIGINT e2e 后等待优雅退出 (超时 SIGKILL)
+    inject_kill_wait_s: 10.0       # SIGINT 注入链后等待退出 (超时 SIGKILL)
+    scenario_timeout_s: 900.0      # 单场景兜底超时 (门控 300s + 场景 60s 仿真时长按 ~1.9x 墙钟换算 + 余量)
+    rviz: true                    # 循环模式 e2e 每场景重启, rviz 常开会频繁重开窗口, 建议 false
+
+# ---------------- 传感器故障注入 (sensor_fault_injector 常驻节点) ----------------
+# 话题顶替: interface 发布 *_raw, 本节点篡改/透传后顶替发布原话题名;
+# monitor 每测例经 configure 服务注入, 场景收尾 configure 空组 off (纯透传)
+sensor_fault_injector:
+  # 注入编排模式 (需求 21): auto=auto_loop (monitor 逐场景自动编排注入);
+  # manual=on_demand (monitor 常驻, execute_batch 服务按需入队执行)
+  orchestration: auto
+  raw_topic: "/sensing/lidar/top/pointcloud_before_sync_raw"    # 订阅 (interface 改名后发布)
+  faulted_topic: "/sensing/lidar/top/pointcloud_before_sync"    # 顶替发布 (感知链订阅的原话题名)
+  configure_service: "/fault_injection/configure"   # 故障注入配置服务 (原子替换全部实例)
+  kinematic_state_topic: "/localization/kinematic_state"   # speed 触发门控数据源 (nav_msgs/Odometry)
+  supported_sensors: ["top"]      # 与 sensor_mapping.yaml id 同名; 缺失/不受支持 -> configure 拒绝
+  base_seed: 42                   # 实例 RNG seed 基址 (可复现)
+  qos_depth: 10                   # 对齐 interface best_effort
+

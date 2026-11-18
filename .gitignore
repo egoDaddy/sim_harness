@@ -1,0 +1,6 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# setuptools 开发安装产物
+*.egg-info/

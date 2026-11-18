@@ -1,0 +1,5 @@
+source /opt/ros/humble/setup.bash
+source /home/xuhua/autoware/install/setup.bash
+source /home/carla_disk/carla_ros_bridge/catkin_ws/install/local_setup.bash
+source install/local_setup.bash
+ros2 launch autoware_srunner autoware_srunner_launch.py
