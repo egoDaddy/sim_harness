@@ -123,12 +123,19 @@ sim:smoke:
       # _routing_service_ready() 误判 "e2e ready" 而秒开跑; 而残留集群不完整
       # (缺 /api/operation_mode/change_to_autonomous) -> 注入链 wait_for_ready
       # 卡满超时 -> 无 set_route/无 engage -> ego 不动 -> 全 criteria FAILURE.
+      set -x
+      # 排除本 job 进程树, 防止 pattern 命中 job 自身 shell 而被误杀
+      SELF_PIDS="$(echo $$; ps -o ppid= -p $$ | tr -d ' '; pgrep -P $$)"
       for pat in "$AUTOWARE_WS/install" 'e2e_simulator.launch.xml' \
                  'autoware_srunner_launch.py' 'lib/autoware_srunner/scenario_monitor' \
                  'carla_ros_scenario_runner' 'lib/autoware_srunner/npc_marker_publisher' \
                  'rclcpp_components/component_container' 'rviz2' \
                  'scenario_runner-0.9.16/scenario_runner.py'; do
-        pgrep -f "$pat" | xargs -r kill -9 2>/dev/null || true
+        for p in $(pgrep -f "$pat"); do
+          case " $SELF_PIDS " in *" $p "*) echo "  跳过自身/本 job 进程: $p ($pat)"; continue ;; esac
+          kill -9 "$p" 2>/dev/null
+          true
+        done
       done
       # scenario_runner.py 是 carla_ros_scenario_runner 的子进程, wrapper 被 SIGINT
       # 后会孤儿化并继续持有 Traffic Manager 的 RPC 端口 (8000 起), 使下一轮场景在
@@ -142,12 +149,14 @@ sim:smoke:
         for ino in $inodes; do
           tpid=$(ls -l /proc/[0-9]*/fd 2>/dev/null | grep "socket:\[$ino\]" | sed -n 's#.*/proc/\([0-9]*\)/fd.*#\1#p' | head -1)
           if [ -n "$tpid" ]; then
+            case " $SELF_PIDS " in *" $tpid "*) echo "  跳过自身进程: $tpid"; continue ;; esac
             echo "  释放 :$port (pid $tpid)"
             kill -9 "$tpid" 2>/dev/null || true
           fi
         done
       done
-      sleep 2
+      sleep 1
+      set +x
       # FastDDS 共享内存段残留会占满端口 (open_and_lock_file failed) 并污染发现
       rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps* 2>/dev/null || true
       echo "  剩余 e2e 进程: $(pgrep -f 'e2e_simulator.launch.xml' | wc -l)"
