@@ -28,7 +28,9 @@ from launch.actions import (DeclareLaunchArgument, GroupAction, OpaqueFunction,
                             RegisterEventHandler, SetEnvironmentVariable, Shutdown)
 from launch.event_handlers import OnProcessExit, OnShutdown
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
+from launch.utilities import perform_substitutions
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def _path_list(value):
@@ -167,6 +169,18 @@ def _launch_setup(context):
     xosc_final, fault_final, orch_final = _resolve_cli_inputs(
         xosc_arg, fault_arg, orch_arg, lc.get('cycle', {}), fi)
 
+    # e2e 子进程要恢复的用户 shell 原始环境, 必须在这里 (OpaqueFunction 顶层)
+    # 就取好: monitor 节点被包在 _carla_env_actions 的 Group 里, 组内的
+    # SetEnvironmentVariable 会先把 PYTHONPATH/LD_PRELOAD 改写掉。
+    # 且必须用 ParameterValue(value_type=str) 绕过 launch 的 yaml.safe_load:
+    # 形如 "/xxx/libcudart.so:" 的值会被 yaml 解析成 {"/xxx/libcudart.so": None}
+    # 而报 TypeError (Got <class 'dict'>), 在 CI 干净环境 (LD_PRELOAD 为空)
+    # 拼出结尾冒号时必现。
+    orig_pythonpath = perform_substitutions(
+        context, [EnvironmentVariable('PYTHONPATH', default_value='')])
+    orig_ld_preload = perform_substitutions(
+        context, [EnvironmentVariable('LD_PRELOAD', default_value='')])
+
     actions = []
 
     # ---- CARLA python 环境: 仅注入给需要 carla 的进程组, 严禁污染 autoware 节点 ----
@@ -304,8 +318,8 @@ def _launch_setup(context):
         output='screen',
         parameters=[{
             'asr_config': cfg_file,
-            'e2e_pythonpath': EnvironmentVariable('PYTHONPATH', default_value=''),
-            'e2e_ld_preload': EnvironmentVariable('LD_PRELOAD', default_value=''),
+            'e2e_pythonpath': ParameterValue(orig_pythonpath, value_type=str),
+            'e2e_ld_preload': ParameterValue(orig_ld_preload, value_type=str),
             'results_dir': results_dir,
             'metrics_topic': mt.get('metrics_topic', '/carla/srunner/metrics'),
             # 编排控制参数 (CLI > yaml 覆盖语义已在本 launch 解析为最终值)
