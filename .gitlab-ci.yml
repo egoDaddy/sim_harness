@@ -133,12 +133,37 @@ sim:smoke:
       # scenario_runner.py 是 carla_ros_scenario_runner 的子进程, wrapper 被 SIGINT
       # 后会孤儿化并继续持有 Traffic Manager 的 RPC 端口 (8000 起), 使下一轮场景在
       # "trying to create rpc server for traffic manager" 处直接 ERROR。
-      for port in 8000 8001 8002 8003; do
-        tpid=$(ss -ltnp 2>/dev/null | grep ":$port " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
-        if [ -n "$tpid" ]; then
-          echo "  释放 :$port (pid $tpid)"
-          kill -9 "$tpid" 2>/dev/null || true
-        fi
+      # 用 python 解析 /proc/net/tcp 找监听 8000-8003 的进程 (不依赖 ss, runner PATH 没有它)
+      tm_pids=$(python3 -c '
+import glob, os
+targets = {8000, 8001, 8002, 8003}
+owners = {}
+for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        lines = open(f).read().splitlines()[1:]
+    except Exception:
+        continue
+    for ln in lines:
+        p = ln.split()
+        if len(p) >= 10 and p[3] == "0A":
+            port = int(p[1].split(":")[1], 16)
+            if port in targets:
+                owners[port] = p[9]
+for fd in glob.glob("/proc/[0-9]*/fd/*"):
+    try:
+        t = os.readlink(fd)
+        if "socket:[" in t:
+            ino = t[t.index("[") + 1:-1]
+            for port, i in list(owners.items()):
+                if i == ino:
+                    owners[port] = fd.split("/")[2]
+    except Exception:
+        pass
+print(" ".join(sorted(set(o for o in owners.values() if o.isdigit()))))
+' || true)
+      for tpid in $tm_pids; do
+        echo "  释放 TM 端口占用 (pid $tpid)"
+        kill -9 "$tpid" 2>/dev/null || true
       done
       sleep 2
       # FastDDS 共享内存段残留会占满端口 (open_and_lock_file failed) 并污染发现
