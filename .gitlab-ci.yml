@@ -100,12 +100,23 @@ sim:smoke:
     # 刻意不用 set -e: launch 与清理步骤允许非零, 结论只认 judge 的退出码
     # 同样先 source (非 -u 安全) 再开 -u
     - set -o pipefail
+    # CI 无头: 抹掉 DISPLAY, 避免任何节点 (rviz2) 抢 GPU 卡住跑批
+    - unset DISPLAY
     - cd "$ASR_WS"
     - source /opt/ros/humble/setup.bash
     - source "$AUTOWARE_WS/install/setup.bash"
     - source install/setup.bash
     - set -u
     - rm -rf "$CI_OUT/sim" && mkdir -p "$CI_OUT/sim"
+    - |
+      echo "== [0a/4] 生成 CI 专用编排配置 (关 rviz) =="
+      # monitor 每场景 relaunch e2e, rviz 常开会反复开窗 + 吃 GPU;
+      # CI 无人看画面 -> 用配置副本把 lifecycle.cycle.rviz 改成 false
+      CI_CFG="$CI_OUT/asr_ci.yaml"
+      cp "$ASR_WS/src/autoware_srunner/config/autoware_srunner.yaml" "$CI_CFG"
+      sed -i -E 's/^([[:space:]]{4})rviz: true/\1rviz: false/' "$CI_CFG"
+      grep -nE '^ +rviz:' "$CI_CFG"
+      grep -qE '^ {4}rviz: false' "$CI_CFG" || { echo "FAIL: rviz 未改成 false"; exit 1; }
     - |
       echo "== [0/4] 清场: 先销毁上一轮残留 actor, 再跑 (否则重复 ego / 孤儿传感器) =="
       env PYTHONPATH="$CARLA_PY:${PYTHONPATH:-}" LD_PRELOAD="$CARLA_CUDART" \
@@ -119,6 +130,7 @@ sim:smoke:
       echo "== [2/4] 跑批 (timeout 发 INT 让 launch 走 shutdown 收尾) =="
       timeout --signal=INT --kill-after=120 "$SIM_TIMEOUT" \
         ros2 launch autoware_srunner autoware_srunner_launch.py \
+          asr_config:="$CI_OUT/asr_ci.yaml" \
           scenario_root:="$ASR_WS/scenarios" \
           fault_root:="$ASR_WS/fault" \
           results_dir:="$CI_OUT/sim" \
