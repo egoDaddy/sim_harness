@@ -33,6 +33,17 @@ default:
   tags: [carla-sim]            # 只匹配仿真机上的 shell runner (docker1 不接)
   interruptible: false         # 跑批中不许被新 pipeline 抢占
 
+# --------------------------------------------------------------- 0. 探针 (临时)
+# 只做 echo, 继承与 contract 完全相同的全局 variables/default。
+# 用途: 区分"prepare environment 失败"是全局配置导致, 还是 job 自身导致。
+probe:
+  stage: contract
+  tags: [carla-sim]
+  script:
+    - echo probe-ok
+    - echo "ASR_WS=$ASR_WS"
+    - echo "CI_OUT=$CI_OUT"
+
 # --------------------------------------------------------------- 1. 契约校验
 contract:
   stage: contract
