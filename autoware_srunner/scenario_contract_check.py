@@ -19,15 +19,20 @@ contract stage 把错配提前拦下。
                   == autoware 侧 sensor_mapping_<tag>.yaml; 且 catalog 的
                   sensor_id 覆盖 mapping 的 id (interface 发现式 listen 的键)
   C6 结果目录   : 残留 json 会被 monitor 按 mtime 当成本次判定 (CI 假通过风险)
+  C7 版本照片   : 场景库/故障库/autoware 的实际 commit 与 versions.lock.yaml
+                  一致; scenario_runner 的本地补丁 sha256 未被覆盖
 
 退出码: 0 = 无 FAIL (WARN 允许); 1 = 存在 FAIL。
 用法:
   python3 scenario_contract_check.py                # 用包内/源码树 config
   scenario_contract_check --scenario-root /path/scenario_lib --strict
+  scenario_contract_check --lock versions.lock.yaml --strict   # 连版本一起对
 """
 import argparse
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
@@ -483,7 +488,145 @@ def check_c6(ctx, rep):
         rep.pass_('C6', 'results_root 干净 (无残留 json)')
 
 
+# ---------------------------------------------------------------- C7 版本照片
+def _git(path, *args):
+    """只读 git 查询; 任何失败都返回 (rc<0, ''), 不抛异常 (日志要能继续)."""
+    try:
+        p = subprocess.run(['git', '-C', path] + list(args),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=20)
+        return p.returncode, p.stdout.decode('utf-8', 'replace').strip()
+    except (OSError, subprocess.SubprocessError):
+        return -1, ''
+
+
+def _sha256(path):
+    """文件指纹 (补丁被覆盖/重装丢失时能看出来)."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _lock_path(base, raw):
+    """lock 里的 path: 相对路径以 lock 文件所在目录为基准."""
+    raw = os.path.expanduser(str(raw or '')).strip()
+    if not raw:
+        return ''
+    return raw if os.path.isabs(raw) else os.path.normpath(os.path.join(base, raw))
+
+
+def check_c7(ctx, rep):
+    """拿 versions.lock.yaml 这份照片与机器上的实际版本对账.
+
+    判定语义 (谁变了谁负责):
+      - commit 不符 -> FAIL: 跑的不是照片里那份, 结论与历史不可比
+      - 目录缺失 / 不是 git 仓 -> FAIL: 无版本可对
+      - 有未提交改动 -> allow_dirty 时 WARN (开发期), 否则 FAIL
+    """
+    lock_path = ctx.get('lock') or ''
+    if not lock_path or not os.path.isfile(lock_path):
+        rep.warn('C7', '无 versions.lock.yaml -> 版本未锁, "昨天绿今天红" 无法归因')
+        return
+    try:
+        with open(lock_path) as f:
+            lock = yaml.safe_load(f) or {}
+    except (OSError, ValueError) as e:
+        rep.fail('C7', 'lock 文件不可解析 (%s): %s' % (lock_path, e))
+        return
+
+    base = os.path.dirname(os.path.abspath(lock_path))
+    rep.pass_('C7', 'lock=%s (schema=%s)' % (lock_path, lock.get('schema')))
+
+    for name in ('scenario_lib', 'fault_lib', 'autoware'):
+        ent = lock.get(name) or {}
+        path = _lock_path(base, ent.get('path'))
+        want = str(ent.get('commit') or '').strip()
+        if not path:
+            rep.fail('C7', '%s.path 未声明 -> 该类资产无版本可对' % name)
+            continue
+        if not os.path.isdir(path) and name != 'autoware':
+            # 安装态下 lock 可能从 share/build 目录被读到, 相对基准会漂;
+            # 此时回退到编排配置里的资产根 (它们才是运行时真正读的位置)
+            fb = ctx.get('scenario_root' if name == 'scenario_lib' else 'fault_root')
+            if fb and os.path.isdir(fb):
+                rep.warn('C7', 'lock 中 %s.path 不可达 (%s), 改用配置根 %s'
+                         % (name, path, fb))
+                path = fb
+        if not os.path.isdir(path):
+            rep.fail('C7', '%s 目录不存在: %s -> 照片与机器不是同一份'
+                     % (name, path))
+            continue
+        rc, head = _git(path, 'rev-parse', 'HEAD')
+        if rc != 0 or not head:
+            rep.fail('C7', '%s 不是 git 仓: %s -> 先 git init + commit 才有版本'
+                     % (name, path))
+            continue
+        if want and not head.startswith(want):
+            rep.fail('C7', '%s 版本不符: lock=%s 实际=%s -> 要么改回照片那次,'
+                     ' 要么在新版本上重跑全量并更新 lock'
+                     % (name, want, head[:12]))
+            continue
+        _, dirty = _git(path, 'status', '--porcelain')
+        if dirty:
+            msg = ('%s @ %s 有未提交改动 (%d 行) -> 实质跑的与照片不完全一致'
+                   % (name, head[:12], len(dirty.splitlines())))
+            if ent.get('allow_dirty'):
+                rep.warn('C7', msg)
+            else:
+                rep.fail('C7', msg + '; 本类资产要求精确匹配')
+        else:
+            rep.pass_('C7', '%s @ %s (干净)' % (name, head[:12]))
+
+    sr = lock.get('scenario_runner') or {}
+    if sr:
+        path = _lock_path(base, sr.get('path'))
+        ver = str(sr.get('version') or '')
+        if not path or not os.path.isdir(path):
+            rep.fail('C7', 'scenario_runner 目录不存在: %s' % (path or '(未声明)'))
+            return
+        if ver and ver not in os.path.basename(path):
+            rep.warn('C7', 'scenario_runner 目录名不含 version=%r (%s) -> 仅提示'
+                     % (ver, os.path.basename(path)))
+        for item in (sr.get('patched') or []):
+            fpath = os.path.join(path, str(item.get('file') or ''))
+            want = str(item.get('sha256') or '').lower()
+            if not os.path.isfile(fpath):
+                rep.fail('C7', 'scenario_runner 补丁文件不存在: %s -> 该版本被'
+                               '替换/未打补丁' % fpath)
+                continue
+            got = _sha256(fpath)
+            if want and got != want:
+                rep.fail('C7', 'scenario_runner 补丁指纹不符: %s\n'
+                               '         lock=%s\n         实际=%s\n'
+                               '         -> 补丁丢失/被覆盖 (丢了 SYNC_FLAG 补丁会与'
+                               ' monitor 抢同步, 表现为随机 NO_CRITERIA)'
+                         % (os.path.relpath(fpath, path), want, got))
+            else:
+                rep.pass_('C7', 'scenario_runner %s 补丁指纹匹配 (%s)'
+                          % (ver, os.path.basename(fpath)))
+
+
 # ----------------------------------------------------------------------- 入口
+def default_lock():
+    """lock 定位: ASR_LOCK > 源码树 harness 仓根 > ament share."""
+    cands = [os.environ.get('ASR_LOCK', ''),
+             os.path.normpath(os.path.join(
+                 os.path.dirname(os.path.abspath(__file__)),
+                 '..', 'versions.lock.yaml'))]
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        cands.append(os.path.join(get_package_share_directory('autoware_srunner'),
+                                  'versions.lock.yaml'))
+    except Exception:  # pylint: disable=broad-except
+        pass
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return ''
+
+
 def default_config():
     """配置定位顺序: ASR_CONFIG > 源码树(../config, build 前也可跑) > ament share."""
     cands = [os.environ.get('ASR_CONFIG', ''),
@@ -514,6 +657,8 @@ def build_parser():
     ap.add_argument('--catalog', default='', help='ControllerCatalog.xosc 路径')
     ap.add_argument('--mapping-dir', default='',
                     help='autoware 侧 sensor_mapping*.yaml 所在目录 (不可达则跳过 C4 侧 3)')
+    ap.add_argument('--lock', default='',
+                    help='版本照片 versions.lock.yaml (默认自动定位; 传 none 跳过 C7)')
     ap.add_argument('--strict', action='store_true', help='WARN 也视为失败')
     ap.add_argument('--json', default='', help='把结果写成 JSON (CI artifact)')
     return ap
@@ -542,9 +687,12 @@ def main(argv=None):
     mapping_dir = os.path.expanduser(args.mapping_dir) or \
         paths.get('sensor_mapping_dir') or os.environ.get('ASR_SENSOR_MAPPING_DIR', '')
 
+    lock = '' if args.lock.lower() == 'none' else (args.lock or default_lock())
+
     ctx = {
         'cfg': cfg,
         'cfg_path': cfg_path,
+        'lock': lock,
         'scenario_root': scenario_root,
         'fault_root': fault_root,
         'results_root': results_root,
@@ -564,11 +712,13 @@ def main(argv=None):
     print('results_root  : %s' % results_root)
     print('xosc_list     : %s' % (ctx['xosc_list'] or '(空)'))
     print('fault_matrix  : %s' % (ctx['fault_matrix'] or '(空)'))
+    print('lock          : %s' % (lock or '(无, 跳过 C7)'))
     print('-' * 72)
 
     rep = Report()
     # C5 先于 C3: 矩阵驱动模式下场景清单由矩阵提供, 需先展开再逐个查结构
-    for fn in (check_c1, check_c2, check_c5, check_c3, check_c4, check_c6):
+    for fn in (check_c1, check_c2, check_c5, check_c3, check_c4, check_c6,
+               check_c7):
         try:
             fn(ctx, rep)
         except Exception as e:  # pylint: disable=broad-except
@@ -580,7 +730,7 @@ def main(argv=None):
     if args.json:
         payload = {'ok': ok, 'counts': counts, 'rows': rep.rows,
                    'scenario_root': scenario_root, 'fault_root': fault_root,
-                   'config': cfg_path}
+                   'config': cfg_path, 'lock': lock}
         try:
             with open(args.json, 'w') as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)

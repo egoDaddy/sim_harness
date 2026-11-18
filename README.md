@@ -58,6 +58,22 @@ python3 src/autoware_srunner/autoware_srunner/scenario_contract_check.py \
 | C3 场景结构 | ego ScenarioObject 名 = `ego_role_name`; catalog 条目命中; `ego_trajectory_ref` 同名 json 存在; 有 `criteria_` 判据 | 附着超时 / 注入链静默降级 / 只能拿到 exit 3 |
 | C4 传感器三侧 | yaml 标签 = catalog 条目后缀 = `sensor_mapping_<tag>.yaml`; catalog 的 sensor_id 覆盖 mapping 的 id | 感知无数据 |
 | C6 结果目录 | 残留 json | 按 mtime 取最新 -> 上次结果冒充本次 |
+| C7 版本照片 | 场景库/故障库/autoware 的实际 commit 与 `versions.lock.yaml` 一致; scenario_runner 补丁 sha256 未被覆盖 | 跑的与记录的不是同一份, "昨天绿今天红" 无法归因 |
+
+## 版本照片 (versions.lock.yaml)
+
+三个仓 + 被测物各记一个版本, 跑测试前先对账。lock 只声明不改变任何东西,
+由 `--lock` 交给 C7 执行 (默认自动定位本文件同级 `versions.lock.yaml`):
+
+| 对象 | 锁什么 | 为什么 |
+|---|---|---|
+| 场景库 / 故障库 | `commit` + `allow_dirty` | 加删测例会改变结论; 开发期允许脏 (WARN), CI 用 `--strict` 变 FAIL |
+| autoware | `commit` | 被测物换了 commit, 红线基线不再可比 |
+| scenario_runner | `version` + 补丁文件 `sha256` | 它非 git 仓: 重装/覆盖会丢掉 `SCENARIO_RUNNER_SYNC_FLAG` 补丁, 表现为随机 NO_CRITERIA |
+
+判定: commit 不符 / 目录缺失 / 非 git 仓 → FAIL; 有未提交改动且 `allow_dirty: true` → WARN。
+换版本的正确姿势: 在新版本上重跑全量 → 绿了再改 lock (`改照片` 是一次显式提交)。
+lock 里的 `path` 相对本文件所在目录解析, 换机器/拆仓用 `--lock` 指另一份或改 path。
 
 ## 需求 1 补丁 (scenario_runner)
 

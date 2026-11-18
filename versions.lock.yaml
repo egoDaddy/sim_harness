@@ -1,0 +1,48 @@
+# ============================================================================
+# versions.lock.yaml — 版本照片 (第四刀)
+#
+# 作用: 跑测试前拿这份"照片"和机器上实际的版本比对, 不一致就拦下。
+#       解决"昨天绿今天红, 但没人改过测试代码" —— 一眼看出是谁偷偷变了。
+#
+# 只声明, 不改变任何东西。它由 scenario_contract_check.py 的 C7 组读取;
+# 更新它必须是一次显式提交 (改照片 = 一次被记录的动作)。
+#
+# path 若为相对路径, 基准是本文件所在目录 (harness 仓根);
+# 拆仓/换机器时用 C7 的 --lock 指向另一份 lock, 或直接改这里的 path。
+# ============================================================================
+schema: 1
+
+# ---------------------------------------------------------------- 场景库 (自仓)
+scenario_lib:
+  path: "../../scenarios"
+  commit: "d233f857c6f7"     # git rev-parse HEAD 前 12 位
+  allow_dirty: true          # 开发期允许未提交改动 -> WARN; CI 加 --strict 变 FAIL
+
+# ---------------------------------------------------------------- 故障库 (自仓)
+fault_lib:
+  path: "../../fault"
+  commit: "b28b5e987b25"
+  allow_dirty: true
+
+# ------------------------------------------------------ 被测物 (autoware 仓)
+# 单仓形态: core/universe/launcher/... 都在同一 .git 下, 锁顶层 commit 即可。
+# 若将来拆成多仓, 这里改成 vcs export --exact 的 .repos 快照 (见 README)。
+autoware:
+  path: "/home/xuhua/autoware"
+  commit: "10718787ba6e"
+  allow_dirty: true          # 本机有未入库的 src/ 目录, 先按 WARN; CI 稳定后可改 false
+
+# ------------------------------------------- 仿真器 (非 git 仓, 只能锁指纹)
+# scenario_runner 是解压目录, 没有 commit。改为锁: 版本号 + 本地补丁文件的 sha256。
+# 补丁被覆盖/重装丢补丁 -> sha256 变 -> FAIL (这正是最容易静默失效的一环:
+# 丢了 SCENARIO_RUNNER_SYNC_FLAG, scenario_runner 会自己 tick, 与 monitor 抢同步)。
+scenario_runner:
+  path: "/home/carla_disk/scenario_runner-0.9.16"
+  version: "0.9.16"
+  patched:
+    - file: "srunner/scenariomanager/carla_data_provider.py"
+      sha256: "dfbdf598fc00506a4c0140d6ad1282c95bcc66177d44c7cd250c75dbec405228"
+
+# 不锁 (机器绑定, 锁了只会天天报警): /opt/ros/humble、CUDA、python 小版本。
+# CARLA 是常驻服务, 不能按 lock 启停, 暂只做人工记录:
+# carla_server: "0.9.16"

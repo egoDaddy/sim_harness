@@ -14,6 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml') + glob('config/*.rviz')),
         (os.path.join('share', package_name, 'launch'), ['launch/autoware_srunner_launch.py']),
+        (os.path.join('share', package_name), ['versions.lock.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
