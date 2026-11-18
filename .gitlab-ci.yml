@@ -1,0 +1,138 @@
+# ============================================================================
+# harness 仓 (xuhua/sim_harness) 的 pipeline 定义
+#
+# 为什么是 shell executor + GIT_STRATEGY=none:
+#   - CARLA 是常驻服务 (localhost:2000), 世界由 scenario_runner 加载;
+#     autoware / scenario_runner / map 全是 /home 绝对路径, 只能跑在这台机器上
+#   - 本文件随 harness 仓推送到 GitLab, 但执行用 runner 所在机器的固定工作区,
+#     因此必须用 $CI_COMMIT_SHA 核对工作区 HEAD (contract job 第一步)
+#
+# 阶段:
+#   contract  秒级: 工作区=本次提交 + 跨仓契约 C1~C7 (暂不 --strict, WARN 只打印)
+#   build     分钟级: colcon build + console script 存在性
+#   sim:smoke 十分钟级: 单场景跑批 -> judge_run_summary.py 按 run_summary.json 判定
+#
+# 判定原则: ros2 launch 的返回码不可信, 唯一来源是 run_summary.json 的
+#           summary.exit_code (0 通过 / 1 编排异常 / 2 测试失败 / 3 结论不可靠)
+# ============================================================================
+stages: [contract, build, sim]
+
+variables:
+  # 不 clone: runner 直接操作固定工作区 (否则 builds/ 里的副本没有
+  # autoware install / CARLA / map, 跑不起来)
+  GIT_STRATEGY: none
+  ASR_WS: "/home/carla_disk/carla_project/autoware_srunner_ws"
+  AUTOWARE_WS: "/home/xuhua/autoware"
+  CARLA_PY: "/home/carla_disk/carla/PythonAPI/carla"
+  CARLA_CUDART: "/usr/local/cuda/lib64/libcudart.so"
+  # pipeline 产物落在 CI_PROJECT_DIR 内, artifacts 才能被 runner 收集
+  CI_OUT: "$CI_PROJECT_DIR/ci_out"
+  SIM_TIMEOUT: "2400"          # 40 min 墙钟兜底 (job timeout 之外的第二道闸)
+
+default:
+  tags: [carla-sim]            # 只匹配仿真机上的 shell runner (docker1 不接)
+  interruptible: false         # 跑批中不许被新 pipeline 抢占
+
+# --------------------------------------------------------------- 1. 契约校验
+contract:
+  stage: contract
+  resource_group: carla_sim
+  timeout: 10m
+  script:
+    - set -euo pipefail
+    - |
+      echo "== [1/3] 工作区版本 = 本次提交 =="
+      cd "$ASR_WS"
+      HARNESS_HEAD=$(git -C src/autoware_srunner rev-parse HEAD)
+      if [ "$HARNESS_HEAD" != "$CI_COMMIT_SHA" ]; then
+        echo "FAIL: 工作区 HEAD=$HARNESS_HEAD, 本次提交=$CI_COMMIT_SHA"
+        echo "      -> 在仿真机执行: git -C $ASR_WS/src/autoware_srunner fetch origin"
+        echo "         git -C $ASR_WS/src/autoware_srunner checkout $CI_COMMIT_SHA"
+        exit 1
+      fi
+      echo "ok: $HARNESS_HEAD"
+    - |
+      echo "== [2/3] 准备干净输出目录 =="
+      rm -rf "$CI_OUT/contract" && mkdir -p "$CI_OUT/contract"
+    - |
+      echo "== [3/3] 跨仓契约 C1~C7 (FAIL 拦, WARN 只打印) =="
+      python3 src/autoware_srunner/autoware_srunner/scenario_contract_check.py \
+        --results-root "$CI_OUT/contract" \
+        --json "$CI_OUT/contract/contract.json"
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+    paths: ["ci_out/contract/"]
+
+# --------------------------------------------------------------- 2. 构建
+build:
+  stage: build
+  timeout: 20m
+  needs: [contract]
+  script:
+    - set -euo pipefail
+    - cd "$ASR_WS"
+    - source /opt/ros/humble/setup.bash
+    - colcon build --symlink-install --packages-select autoware_srunner autoware_srunner_msgs
+    - |
+      echo "== console script 存在性 =="
+      for e in scenario_monitor scenario_contract_check set_route \
+               trajectory_publisher destroy_actors wait_for_ready; do
+        test -x "install/autoware_srunner/lib/autoware_srunner/$e" \
+          || { echo "FAIL: 缺 console script $e"; exit 1; }
+      done
+      echo "ok: 12 个入口齐全"
+
+# --------------------------------------------------------------- 3. 冒烟跑批
+sim:smoke:
+  stage: sim
+  resource_group: carla_sim
+  needs: [build]
+  timeout: 50m
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+  script:
+    # 刻意不用 set -e: launch 与清理步骤允许非零, 结论只认 judge 的退出码
+    - set -uo pipefail
+    - cd "$ASR_WS"
+    - source /opt/ros/humble/setup.bash
+    - source "$AUTOWARE_WS/install/setup.bash"
+    - source install/setup.bash
+    - rm -rf "$CI_OUT/sim" && mkdir -p "$CI_OUT/sim"
+    - |
+      echo "== [0/4] 清场: 先销毁上一轮残留 actor, 再跑 (否则重复 ego / 孤儿传感器) =="
+      env PYTHONPATH="$CARLA_PY:${PYTHONPATH:-}" LD_PRELOAD="$CARLA_CUDART" \
+        install/autoware_srunner/lib/autoware_srunner/destroy_actors \
+          --host localhost --port 2000 || true
+    - |
+      echo "== [1/4] CARLA 预检 (常驻服务, 这里只读不启停) =="
+      env PYTHONPATH="$CARLA_PY:${PYTHONPATH:-}" LD_PRELOAD="$CARLA_CUDART" \
+        python3 -c "import carla;c=carla.Client('localhost',2000);c.set_timeout(5);print('CARLA server', c.get_server_version())"
+    - |
+      echo "== [2/4] 跑批 (timeout 发 INT 让 launch 走 shutdown 收尾) =="
+      timeout --signal=INT --kill-after=120 "$SIM_TIMEOUT" \
+        ros2 launch autoware_srunner autoware_srunner_launch.py \
+          scenario_root:="$ASR_WS/scenarios" \
+          fault_root:="$ASR_WS/fault" \
+          results_dir:="$CI_OUT/sim" \
+          xosc_list:="${XOSC_LIST:-xosc_list.json}" \
+          orchestration:=auto \
+        > "$CI_OUT/sim/launch.log" 2>&1 || true
+    - |
+      echo "== [3/4] 判定 (唯一可信来源 = run_summary.json) =="
+      python3 src/autoware_srunner/ci/judge_run_summary.py \
+        --summary "$CI_OUT/sim/run_summary.json"
+    - echo "== [4/4] 完成 =="
+  after_script:
+    # 无论 job 怎么结束都补一刀清场 (强杀/超时路径不走 launch 的 OnShutdown)
+    - |
+      cd "$ASR_WS" && source install/setup.bash 2>/dev/null
+      env PYTHONPATH="$CARLA_PY:${PYTHONPATH:-}" LD_PRELOAD="$CARLA_CUDART" \
+        install/autoware_srunner/lib/autoware_srunner/destroy_actors \
+          --host localhost --port 2000 || true
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+    paths: ["ci_out/sim/"]
