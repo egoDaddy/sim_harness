@@ -21,12 +21,15 @@ import subprocess
 
 import yaml
 
-from ament_index_python.packages import (get_package_prefix,
+from ament_index_python.packages import (PackageNotFoundError,
+                                         get_package_prefix,
                                          get_package_share_directory)
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, GroupAction, OpaqueFunction,
+from launch.actions import (DeclareLaunchArgument, GroupAction,
+                            IncludeLaunchDescription, OpaqueFunction,
                             RegisterEventHandler, SetEnvironmentVariable, Shutdown)
 from launch.event_handlers import OnProcessExit, OnShutdown
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch.utilities import perform_substitutions
 from launch_ros.actions import Node
@@ -307,6 +310,28 @@ def _launch_setup(context):
         parameters=[{'use_sim_time': aw.get('use_sim_time', True), **fi}],
     ))
 
+    # ---- d1.5 最小 default_adapi (operation_mode API 服务提供者) ----
+    # 裁剪版 autoware 的 e2e 里官方 default_adapi.launch.py (19 节点) 的容器
+    # 顺序加载到 manual/local 时 load_node 响应不返回 -> 加载链卡死, 排在其后
+    # 的 operation_mode 永不加载 -> /api/operation_mode/change_to_autonomous
+    # 服务缺失 -> ego 注入链 wait_for_ready 卡满超时 (ego 不动)。故 harness
+    # 侧用独立容器只加载 operation_mode (与编排器同生命周期, 场景间不随 e2e
+    # 重启), 详见 launch/default_adapi_mini.launch.py; 有常驻 adapi 的环境
+    # 可 launch_default_adapi:=false 关闭。
+    adapi_arg = (LaunchConfiguration('launch_default_adapi').perform(context)
+                 or '').strip().lower()
+    if adapi_arg in ('', 'true', '1'):
+        try:
+            get_package_share_directory('autoware_default_adapi_universe')
+        except PackageNotFoundError:
+            print('[autoware_srunner] autoware_default_adapi_universe 未安装, '
+                  '跳过 default_adapi mini (change_to_autonomous 需外部提供)')
+        else:
+            actions.append(IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(
+                    get_package_share_directory('autoware_srunner'),
+                    'launch', 'default_adapi_mini.launch.py'))))
+
     # ---- d2. 循环编排器 (scenario_monitor): 逐场景编排 e2e/注入链/execute_scenario,
     #      全部场景完成后退出 -> 触发 Shutdown (需求 1/5/6/7) ----
     # e2e_pythonpath/e2e_ld_preload: 用户 shell 原始环境 (launch 进程继承值),
@@ -376,5 +401,10 @@ def generate_launch_description():
             'orchestration', default_value='',
             description='注入编排模式 auto/manual (CLI 优先; 空则用 yaml'
                         ' sensor_fault_injector 段)'),
+        DeclareLaunchArgument(
+            'launch_default_adapi', default_value='true',
+            description='是否由 harness 拉起最小 default_adapi (operation_mode 节点, '
+                        '提供 /api/operation_mode/change_to_autonomous; 裁剪版 autoware'
+                        ' 官方 adapi 容器会卡死在 manual/local, 故独立加载)'),
         OpaqueFunction(function=_launch_setup),
     ])
