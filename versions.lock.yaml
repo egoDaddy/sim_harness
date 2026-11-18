@@ -15,13 +15,13 @@ schema: 1
 # ---------------------------------------------------------------- 场景库 (自仓)
 scenario_lib:
   path: "../../scenarios"
-  commit: "d233f857c6f7"     # git rev-parse HEAD 前 12 位
+  commit: "07eac20fcaf9"     # git rev-parse HEAD 前 12 位
   allow_dirty: true          # 开发期允许未提交改动 -> WARN; CI 加 --strict 变 FAIL
 
 # ---------------------------------------------------------------- 故障库 (自仓)
 fault_lib:
   path: "../../fault"
-  commit: "b28b5e987b25"
+  commit: "57db6e018988"
   allow_dirty: true
 
 # ------------------------------------------------------ 被测物 (autoware 仓)
