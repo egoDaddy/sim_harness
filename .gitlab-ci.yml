@@ -107,6 +107,10 @@ sim:smoke:
     - source "$AUTOWARE_WS/install/setup.bash"
     - source install/setup.bash
     - set -u
+    # DDS 统一: runner 是 systemd 服务不继承用户 .bashrc (RMW_IMPLEMENTATION=
+    # rmw_cyclonedds_cpp), 默认 fastrtps 在大拓扑下发现/匹配慢 (transient_local
+    # late-joiner 延迟、load_node 概率卡死); 本地 50 条连跑通跑环境即 cyclonedds
+    - export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     - rm -rf "$CI_OUT/sim" && mkdir -p "$CI_OUT/sim"
     - |
       echo "== [0a/4] 生成 CI 专用编排配置 (关 rviz) =="

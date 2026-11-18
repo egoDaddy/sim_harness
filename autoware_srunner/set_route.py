@@ -36,6 +36,7 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
+from autoware_adapi_v1_msgs.msg import RouteState
 from autoware_adapi_v1_msgs.srv import SetRoutePoints
 from autoware_planning_msgs.msg import LaneletRoute
 
@@ -148,12 +149,21 @@ def main():
         node.get_logger().error("等待服务 /api/routing/set_route_points 超时, 确认 e2e 已启动")
         sys.exit(1)
 
-    # route 验证订阅提前建立: TRANSIENT_LOCAL 可收到"已存在的 route"消息
+    # route 验证订阅提前建立: TRANSIENT_LOCAL 可收到"已存在的 route"消息.
+    # 双话题兑底: 新版 RouteSelector 主接口是 /planning/route (默认参数),
+    # MissionPlanner 直发是 /planning/mission_planning/route; 两者 QoS 不同时
+    # 单订阅会在 DDS 匹配延迟下错过 transient 消息 -> 误判"route 未发布".
+    # 同时订阅 state 话题用于失败诊断 (区分 state=SET/UNSET).
     got = []
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
     sub = node.create_subscription(LaneletRoute, "/planning/mission_planning/route",
                                    lambda m: got.append(m), qos)
+    sub_main = node.create_subscription(LaneletRoute, "/planning/route",
+                                        lambda m: got.append(m), qos)
+    state_msgs = []
+    sub_state = node.create_subscription(RouteState, "/planning/mission_planning/state",
+                                         lambda m: state_msgs.append(m), qos)
 
     resp = None
     # CI 无头环境启动链长 (odometry -> mission_planner ready 可能 60s+),
@@ -178,9 +188,10 @@ def main():
                 node.get_logger().info("route 已存在 (code=1), 视为已满足, 无需重设")
                 resp.status.success = True
                 break
+            st = state_msgs[-1].state if state_msgs else None
             node.get_logger().warn(
-                "code=1 但 route 未发布 (planner 可能未 ready), 3s 后重试 (%d/15) ..."
-                % (attempt + 1))
+                "code=1 (%s) 但 route 未发布, mission_planner state=%s, 3s 后重试 (%d/15) ..."
+                % (resp.status.message, st, attempt + 1))
             time.sleep(3.0)
             continue
         if resp is not None and not resp.status.success and cli_args.nudge_back_m > 0.0:
