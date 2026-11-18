@@ -22,6 +22,7 @@ PATTERNS = [
     b"e2e_simulator.launch.xml",
     b"autoware_srunner_launch.py",
     b"lib/autoware_srunner/scenario_monitor",
+    b"lib/autoware_srunner/metrics_collector",
     b"carla_ros_scenario_runner",
     b"lib/autoware_srunner/npc_marker_publisher",
     b"rclcpp_components/component_container",

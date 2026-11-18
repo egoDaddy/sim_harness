@@ -156,11 +156,21 @@ def main():
                                    lambda m: got.append(m), qos)
 
     resp = None
-    for attempt in range(10):
+    # CI 无头环境启动链长 (odometry -> mission_planner ready 可能 60s+),
+    # 重试窗口从 10x2s 扩到 15x3s, 服务超时也计次重试而不是直接放弃
+    for attempt in range(15):
         resp = call_set_route(node, cli, gx, gy, cli_args.goal_yaw_deg)
         if resp is not None and resp.status.success:
             break
-        if resp is not None and not resp.status.success and resp.status.code == 1:
+        if resp is None:
+            # 服务无响应 (planner 启动中/过载): 计次重试, 耗尽次数才放弃
+            if attempt + 1 < 15:
+                node.get_logger().warn(
+                    "set_route_points 服务无响应, 3s 后重试 (%d/15) ..." % (attempt + 1))
+                time.sleep(3.0)
+                continue
+            break
+        if not resp.status.success and resp.status.code == 1:
             # code=1 有两种可能: 1) route 真已设置过(幂等) 2) mission_planner 未 ready
             # (state 还是 UNKNOWN, 例: odometry 未到)。用 route 话题消息区分。
             rclpy.spin_once(node, timeout_sec=0.5)   # 收集可能已存在的 transient route
@@ -169,9 +179,9 @@ def main():
                 resp.status.success = True
                 break
             node.get_logger().warn(
-                "code=1 但 route 未发布 (planner 可能未 ready), 2s 后重试 (%d/10) ..."
+                "code=1 但 route 未发布 (planner 可能未 ready), 3s 后重试 (%d/15) ..."
                 % (attempt + 1))
-            time.sleep(2.0)
+            time.sleep(3.0)
             continue
         if resp is not None and not resp.status.success and cli_args.nudge_back_m > 0.0:
             node.get_logger().warn("route 为空 (%s); ego 可能处于交叉口重叠区, 后移重试"
