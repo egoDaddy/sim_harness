@@ -33,17 +33,6 @@ default:
   tags: [carla-sim]            # 只匹配仿真机上的 shell runner (docker1 不接)
   interruptible: false         # 跑批中不许被新 pipeline 抢占
 
-# --------------------------------------------------------------- 0. 探针 (临时)
-# 只做 echo, 继承与 contract 完全相同的全局 variables/default。
-# 用途: 区分"prepare environment 失败"是全局配置导致, 还是 job 自身导致。
-probe:
-  stage: contract
-  tags: [carla-sim]
-  script:
-    - echo probe-ok
-    - echo "ASR_WS=$ASR_WS"
-    - echo "CI_OUT=$CI_OUT"
-
 # --------------------------------------------------------------- 1. 契约校验
 contract:
   stage: contract
@@ -81,9 +70,12 @@ build:
   timeout: 20m
   needs: [contract]
   script:
-    - set -euo pipefail
+    # ROS 的 setup.bash 不是 -u 安全的 (会碰 AMENT_TRACE_SETUP_FILES 等未定义变量),
+    # 所以先 source, 再开 -u。顺序反过来 job 会在 1s 内挂。
+    - set -eo pipefail
     - cd "$ASR_WS"
     - source /opt/ros/humble/setup.bash
+    - set -u
     - colcon build --symlink-install --packages-select autoware_srunner autoware_srunner_msgs
     - |
       echo "== console script 存在性 =="
@@ -106,11 +98,13 @@ sim:smoke:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
   script:
     # 刻意不用 set -e: launch 与清理步骤允许非零, 结论只认 judge 的退出码
-    - set -uo pipefail
+    # 同样先 source (非 -u 安全) 再开 -u
+    - set -o pipefail
     - cd "$ASR_WS"
     - source /opt/ros/humble/setup.bash
     - source "$AUTOWARE_WS/install/setup.bash"
     - source install/setup.bash
+    - set -u
     - rm -rf "$CI_OUT/sim" && mkdir -p "$CI_OUT/sim"
     - |
       echo "== [0/4] 清场: 先销毁上一轮残留 actor, 再跑 (否则重复 ego / 孤儿传感器) =="
