@@ -183,6 +183,20 @@ def _launch_setup(context):
         context, [EnvironmentVariable('PYTHONPATH', default_value='')])
     orig_ld_preload = perform_substitutions(
         context, [EnvironmentVariable('LD_PRELOAD', default_value='')])
+    # 兜底: systemd 服务 / CI runner 不继承 ~/.bashrc 里的
+    #   export LD_PRELOAD=/usr/local/cuda/lib64/libcudart.so
+    # 此时上面取到空串, e2e 子进程随之丢失 cudart 预加载, 实测后果:
+    #   pointcloud_container 加载 libautoware_probabilistic_occupancy_grid_map_common.so
+    #   时报 "undefined symbol: cudaMalloc" -> 容器以 127 退出 -> 点云预处理节点
+    #   (crop_box_filter_self / pointcloud_relay ...) 全部不加载 ->
+    #   /sensing/lidar/concatenated/pointcloud 无发布 -> 扫描匹配器 "No InputSource"
+    #   -> 定位 initialize "align server failed" -> 路由被拒 -> 注入链退出.
+    # 用 environment.ld_preload (CARLA python 库所需 cudart) 作为缺省值.
+    if not orig_ld_preload.strip():
+        orig_ld_preload = (env_cfg.get('ld_preload') or '').strip()
+        if orig_ld_preload:
+            print('[autoware_srunner] LD_PRELOAD 为空, 回退 environment.ld_preload = %s'
+                  % orig_ld_preload)
 
     actions = []
 
