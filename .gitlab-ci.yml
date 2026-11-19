@@ -27,7 +27,7 @@ variables:
   CARLA_CUDART: "/usr/local/cuda/lib64/libcudart.so"
   # pipeline 产物落在 CI_PROJECT_DIR 内, artifacts 才能被 runner 收集
   CI_OUT: "$CI_PROJECT_DIR/ci_out"
-  SIM_TIMEOUT: "1800"          # 30 min 墙钟兜底 (run_summary 落盘会提前结束)
+  SIM_TIMEOUT: "1200"          # 20 min 墙钟兜底 (失败路径已收紧, 到不了这个数)
 
 default:
   tags: [carla-sim]            # 只匹配仿真机上的 shell runner (docker1 不接)
@@ -113,14 +113,23 @@ sim:smoke:
     - export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     - rm -rf "$CI_OUT/sim" && mkdir -p "$CI_OUT/sim"
     - |
-      echo "== [0a/4] 生成 CI 专用编排配置 (关 rviz) =="
+      echo "== [0a/4] 生成 CI 专用编排配置 (关 rviz + 收紧失败兜底) =="
       # monitor 每场景 relaunch e2e, rviz 常开会反复开窗 + 吃 GPU;
       # CI 无人看画面 -> 用配置副本把 lifecycle.cycle.rviz 改成 false
       CI_CFG="$CI_OUT/asr_ci.yaml"
       cp "$ASR_WS/src/autoware_srunner/config/autoware_srunner.yaml" "$CI_CFG"
       sed -i -E 's/^([[:space:]]{4})rviz: true/\1rviz: false/' "$CI_CFG"
+      # 冒烟调试提速: 下面四个只是"失败兜底上限", 正常路径走到即结束, 不受影响.
+      # 场景 Act 仿真时长 60s (StopTrigger), 按 1.9x 墙钟换算 ~114s,
+      # 420s 已留约 4x 余量; 注入链天折由 monitor 立即中止 (不再等满).
+      sed -i -E 's/scenario_timeout_s: [0-9.]+/scenario_timeout_s: 420.0/' "$CI_CFG"
+      sed -i -E 's/e2e_ready_wait_s: [0-9.]+/e2e_ready_wait_s: 120.0/' "$CI_CFG"
+      sed -i -E 's/e2e_shutdown_wait_s: [0-9.]+/e2e_shutdown_wait_s: 30.0/' "$CI_CFG"
+      sed -i -E 's/inject_kill_wait_s: [0-9.]+/inject_kill_wait_s: 5.0/' "$CI_CFG"
+      sed -i -E 's/wait_timeout_s: [0-9.]+/wait_timeout_s: 150.0/' "$CI_CFG"
       grep -nE '^ +rviz:' "$CI_CFG"
       grep -qE '^ {4}rviz: false' "$CI_CFG" || { echo "FAIL: rviz 未改成 false"; exit 1; }
+      grep -nE 'scenario_timeout_s|e2e_ready_wait_s|e2e_shutdown_wait_s|inject_kill_wait_s|wait_timeout_s' "$CI_CFG"
     - |
       echo "== [0b/4] 进程清场: 杀上一轮残留的 e2e / autoware / scenario_runner =="
       # 残留 e2e 会让 monitor 的 _routing_service_ready() 误判秒开跑; 孤儿

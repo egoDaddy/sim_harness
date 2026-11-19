@@ -202,6 +202,7 @@ class ScenarioMonitor(Node):
         self._inject_proc = None
         self._exec_future = None
         self._deadline = 0.0
+        self._progress_next = 0.0    # 场景执行中的进度日志节拍 (区分卡死/慢)
         self._interrupted = False
         self._kill_start = None
         self._kill_deadline = 0.0
@@ -428,6 +429,18 @@ class ScenarioMonitor(Node):
                 self.abort_reason = 'autoware e2e 提前退出 (exit %s)' % rc
                 self._start_teardown()
                 return
+            # 注入链 (wait_for_ready -> set_route -> trajectory_publisher) 夭折即失败:
+            # 没有 route/轨迹 ego 不可能动, 继续等到 scenario_timeout 纯属空耗
+            # (job=93 实证: set_route 15 次重试耗尽后仍空等 ~750s 才超时).
+            # trajectory_publisher 是常驻发布器 (rclpy.spin), 正常不会主动退出;
+            # 因此这里的退出只可能是链路失败 -> 立即收尾并把退出码写进 abort_reason.
+            if self._inject_proc is not None and self._inject_proc.poll() is not None:
+                irc = self._inject_proc.returncode
+                self._inject_proc = None
+                self.abort_reason = 'ego 注入链提前退出 (exit %s, 见 launch.log)' % irc
+                self.get_logger().error(self.abort_reason)
+                self._start_teardown()
+                return
             if self._exec_future is not None and self._exec_future.done():
                 resp = self._exec_future.result()
                 self._exec_future = None
@@ -460,6 +473,14 @@ class ScenarioMonitor(Node):
                 self.abort_reason = self.abort_reason % float(
                     self.cyc.get('scenario_timeout_s', 900.0))
                 self._start_teardown()
+            elif time.monotonic() >= self._progress_next:
+                # 进度节拍: 场景未结束但也没失败时, 每 30s 打一行剩余兜底时间,
+                # 便于从 launch.log 直接判断是"仿真跑得慢"还是"彻底卡死"
+                self._progress_next = time.monotonic() + 30.0
+                self.get_logger().info(
+                    '场景执行中: 剩余兜底 %.0fs (注入链 %s)'
+                    % (max(0.0, self._deadline - time.monotonic()),
+                       'alive' if self._inject_proc else 'none'))
 
         elif st == S_KILL_INJECT:
             if self._kill_proc(self._inject_proc, 'ego 注入链',
