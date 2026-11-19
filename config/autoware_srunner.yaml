@@ -149,6 +149,9 @@ lifecycle:
   status_topic: "/scenario_runner/status"
   host: "localhost"
   port: 2000
+  clean_on_start: true    # 启动时清场: 清除 CARLA 中上次运行残留的车辆/传感器 actors.
+                          # CARLA 常驻时残留 ego/npc 会占住 xosc 的 spawn 点 ->
+                          # scenario_runner 报 Cannot spawn actor -> 场景 result=4 假失败
   # ---- 循环编排 (循环执行模式, 需求 1/4/5/6/7) ----
   cycle:
     # 需要执行的 xosc 列表 (需求 4): [{name, file}] 依次执行, 每场景 autoware relaunch

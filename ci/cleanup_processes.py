@@ -19,6 +19,7 @@ import signal
 # cmdline 匹配模式 (字节串); 命中即杀 (自身祖先链除外)
 PATTERNS = [
     b"/home/xuhua/autoware/install",
+    b"/home/xuhua/autoware/",
     b"e2e_simulator.launch.xml",
     b"autoware_srunner_launch.py",
     b"lib/autoware_srunner/scenario_monitor",
@@ -28,6 +29,12 @@ PATTERNS = [
     b"rclcpp_components/component_container",
     b"rviz2",
     b"scenario_runner-0.9.16/scenario_runner.py",
+    # e2e 里还有大量来自 /opt/ros/humble 的系统包进程 (topic_tools relay,
+    # robot_state_publisher, 各 localizer 等), 它们的 cmdline 不含 autoware
+    # install 路径. 漏杀后果实测: 上一轮残留的 traffic_light_camera_info_relay
+    # 与新一轮同名 -> duplicated_node_checker ERROR -> /autoware/system ERROR
+    # -> modes/autonomous ERROR -> 永不 AUTONOMOUS -> ego 不动.
+    b"/opt/ros/humble/lib/",
 ]
 
 # Traffic Manager RPC 端口 (8000 起), 监听者同样清掉

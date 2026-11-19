@@ -210,6 +210,12 @@ class ScenarioMonitor(Node):
         self._finish_result = 0
         self._latest_metrics = {}
         self.world = None
+        # 启动清场: CARLA 常驻时, 上次运行异常退出可能留下 ego/npc 车辆,
+        # 占住 xosc 的 spawn 点 -> scenario_runner 报 "Cannot spawn actor" ->
+        # ApplicationStatus.ERROR(4) -> 场景 result=4 假失败
+        # (实测 location (334.8, 14.2) 被残留 npc1 占用). 连接成功后先清一次.
+        self._clean_on_start = bool(self.lc.get('clean_on_start', True))
+        self._start_clean_done = False
 
         # ---- ROS 接口 ----
         fin_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -464,6 +470,16 @@ class ScenarioMonitor(Node):
                     result_row['id'] = scn['id']
                 if scn.get('fault_groups'):
                     result_row['fault'] = self._fault_to_dicts(scn['fault_groups'])
+                if self._finish_result != 0:
+                    # result!=0 是 ApplicationStatus 语义 (只有 ERROR=4 会走到这里):
+                    # scenario_runner.py 子进程非零退出, 场景根本没加载/未跑完,
+                    # 与 criteria 无关. 最常见原因: CARLA 中残留 actor 占住 spawn 点
+                    # (报 Cannot spawn actor, 见 launch.log 的 [SC] 段).
+                    reason = ('scenario_runner 子进程异常退出 (result=%s), '
+                              '详见 launch.log 的 [SC] 段 (常见: 残留 actor 占位 -> '
+                              'Cannot spawn actor)' % self._finish_result)
+                    result_row['abort_reason'] = reason
+                    self.get_logger().error(reason)
                 self.results.append(result_row)
                 self.get_logger().info('场景完成 (result=%s, verdict=%s): %s'
                                        % (self._finish_result, verdict, scn['file']))
@@ -847,6 +863,7 @@ class ScenarioMonitor(Node):
                     'verdict': {'result': r['verdict'], 'criteria': r['criteria']},
                     'metrics': r.get('metrics', {}),
                     'fault': r.get('fault'),
+                    'abort_reason': r.get('abort_reason'),
                 }
                 for r in self.results
             ],
@@ -1070,6 +1087,11 @@ class ScenarioMonitor(Node):
             client.set_timeout(5.0)
             self.world = client.get_world()
             self.get_logger().info('CARLA 连接成功')
+            if self._clean_on_start and not self._start_clean_done:
+                self._start_clean_done = True
+                self.get_logger().info(
+                    '启动清场: 清除上次运行残留的车辆/传感器 actors (lifecycle.clean_on_start)')
+                self.destroy_actors()
         except Exception as e:  # pylint: disable=broad-except
             self.get_logger().warn('CARLA 连接失败, 5 秒后重试: %s' % e)
 

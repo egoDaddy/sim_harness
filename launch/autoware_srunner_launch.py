@@ -311,16 +311,20 @@ def _launch_setup(context):
     ))
 
     # ---- d1.5 最小 default_adapi (operation_mode API 服务提供者) ----
-    # 裁剪版 autoware 的 e2e 里官方 default_adapi.launch.py (19 节点) 的容器
-    # 顺序加载到 manual/local 时 load_node 响应不返回 -> 加载链卡死, 排在其后
-    # 的 operation_mode 永不加载 -> /api/operation_mode/change_to_autonomous
-    # 服务缺失 -> ego 注入链 wait_for_ready 卡满超时 (ego 不动)。故 harness
-    # 侧用独立容器只加载 operation_mode (与编排器同生命周期, 场景间不随 e2e
-    # 重启), 详见 launch/default_adapi_mini.launch.py; 有常驻 adapi 的环境
-    # 可 launch_default_adapi:=false 关闭。
-    adapi_arg = (LaunchConfiguration('launch_default_adapi').perform(context)
+    # 默认关闭. 官方 default_adapi 容器 (e2e 侧 /adapi/container, 22 个节点) 本身
+    # 就会加载 /adapi/node/operation_mode; harness 再拉一份 -> 节点重名 ->
+    # duplicated_node_checker ERROR -> /autoware/system ERROR ->
+    # /autoware/modes/autonomous ERROR -> availability.autonomous=false ->
+    # change_to_autonomous 被 adapi 以 ERROR_NOT_AVAILABLE 拒绝 -> operation mode
+    # 永远停在 STOP -> ego 不动 -> 场景判定失败 (实测 acc 0.0/3.0, distance 0.29/10).
+    # 诊断图定义见 autoware_launch/config/system/diagnostics/autoware-carla.yaml:
+    #   modes/autonomous = AND(map, localization, planning, perception, control,
+    #                          vehicle, system, adapi/mrm_request/delegate)
+    # 开关仅给 fastrtps 环境保留: 那时官方容器 load_node 卡在 manual/local,
+    # 排在其后的 operation_mode 永不加载 (服务缺失), 需 mini_adapi:=true 补齐.
+    adapi_arg = (LaunchConfiguration('mini_adapi').perform(context)
                  or '').strip().lower()
-    if adapi_arg in ('', 'true', '1'):
+    if adapi_arg in ('true', '1'):
         try:
             get_package_share_directory('autoware_default_adapi_universe')
         except PackageNotFoundError:
@@ -402,9 +406,10 @@ def generate_launch_description():
             description='注入编排模式 auto/manual (CLI 优先; 空则用 yaml'
                         ' sensor_fault_injector 段)'),
         DeclareLaunchArgument(
-            'launch_default_adapi', default_value='true',
-            description='是否由 harness 拉起最小 default_adapi (operation_mode 节点, '
-                        '提供 /api/operation_mode/change_to_autonomous; 裁剪版 autoware'
-                        ' 官方 adapi 容器会卡死在 manual/local, 故独立加载)'),
+            'mini_adapi', default_value='false',
+            description='是否由 harness 另拉一份最小 default_adapi (只含 operation_mode).'
+                        ' 默认 false: 官方容器已提供该节点, 重复加载会造成节点重名 ->'
+                        ' 诊断图 modes/autonomous ERROR -> 无法切 AUTONOMOUS.'
+                        ' 仅在 fastrtps 下官方容器 load_node 卡死的环境才置 true'),
         OpaqueFunction(function=_launch_setup),
     ])

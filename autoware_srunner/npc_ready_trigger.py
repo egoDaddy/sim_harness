@@ -40,6 +40,11 @@ class NpcReadyTrigger(Node):
 
         self.ego_role_names = set(self.get_parameter('ego_role_names').value)
         self.triggered = False
+        # 门控: 只有本轮 execute_scenario 已发起 (runner STARTING/RUNNING) 后
+        # 才允许 poll_actors 判定 NPC 就位. 否则 CARLA 中上次运行残留的
+        # npc 会让 poll_actors 在场景未开始时立刻 fire -> 注入链提前放行,
+        # 且脏 CARLA 下 xosc spawn 失败被掩盖 (实测 result=4 假失败).
+        self._started = False
         # 退出事件: 与 scenario_monitor 同因, callback 内直接 rclpy.shutdown()
         # 会与 global executor 互相等待而死锁, 改为事件 + spin_once 循环退出
         self.finish_event = threading.Event()
@@ -73,6 +78,9 @@ class NpcReadyTrigger(Node):
         self.get_logger().info('npc_ready_trigger 启动: 等待场景 Init 完成 (NPC 就位) ...')
 
     def on_status(self, msg):
+        if msg.status in (CarlaScenarioRunnerStatus.STARTING,
+                          CarlaScenarioRunnerStatus.RUNNING):
+            self._started = True
         if msg.status == CarlaScenarioRunnerStatus.RUNNING:
             self.fire('scenario_runner status=RUNNING')
 
@@ -80,13 +88,14 @@ class NpcReadyTrigger(Node):
         """编排器循环信号: reset 时复位触发状态并发布 False (下一轮注入链需重新等 True)."""
         if msg.data == 'reset':
             self.triggered = False
+            self._started = False
             reset = Bool()
             reset.data = False
             self.ready_pub.publish(reset)
             self.get_logger().info('收到编排 reset: 复位触发状态, 等待下一场景 NPC 就位')
 
     def poll_actors(self):
-        if self.triggered:
+        if self.triggered or not self._started:
             return
         try:
             actors = self.world.get_actors()
