@@ -149,7 +149,11 @@ sim:smoke:
       # 先搬进台账, 才能事后对比"第一次为什么失败"。
       LEDGER="$CI_OUT/attempts/$CI_PIPELINE_ID"
       mkdir -p "$LEDGER"
-      SEQ=$(( $(ls -1 "$LEDGER" 2>/dev/null | grep -c '^attempt_') + 1 ))
+      # 坑: runner 的 job 脚本隐含 set -e, 而 grep -c 无匹配时退出码是 1、
+      # 配合 pipefail 会让 $( ... ) 返回 1, 于是赋值语句失败 -> 整个 job 静默
+      # 中止 (只留下空台账目录, 无任何报错). 必须 || true 兜住退出码.
+      N=$(ls -1 "$LEDGER" 2>/dev/null | grep -c '^attempt_' || true)
+      SEQ=$(( ${N:-0} + 1 ))
       ATT="$LEDGER/$(printf 'attempt_%02d' "$SEQ")"
       mkdir -p "$ATT"
       if [ -d "$CI_OUT/sim" ]; then
