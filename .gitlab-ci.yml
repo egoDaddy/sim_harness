@@ -11,11 +11,12 @@
 #   contract  秒级: 工作区=本次提交 + 跨仓契约 C1~C7 (暂不 --strict, WARN 只打印)
 #   build     分钟级: colcon build + console script 存在性
 #   sim:smoke 十分钟级: 单场景跑批 -> judge_run_summary.py 按 run_summary.json 判定
+#   report    秒级: 汇总 attempt 台账 -> 指标 (不占 CARLA, sim 失败也跑)
 #
 # 判定原则: ros2 launch 的返回码不可信, 唯一来源是 run_summary.json 的
 #           summary.exit_code (0 通过 / 1 编排异常 / 2 测试失败 / 3 结论不可靠)
 # ============================================================================
-stages: [contract, build, sim]
+stages: [contract, build, sim, report]
 
 variables:
   # 不 clone: runner 直接操作固定工作区 (否则 builds/ 里的副本没有
@@ -32,16 +33,35 @@ variables:
 default:
   tags: [carla-sim]            # 只匹配仿真机上的 shell runner (docker1 不接)
   interruptible: false         # 跑批中不许被新 pipeline 抢占
+  # job 级 retry 只兜"执行环境抖动"(GitLab 调度/接口 + runner 宿主机),
+  # 三类都是 GitLab 能精确识别的原因码:
+  #   runner_system_failure : runner 进程崩 / 机器重启 / 磁盘满 / OOM
+  #   scheduler_failure     : GitLab 调度侧故障
+  #   api_failure           : GitLab 接口调用失败
+  # 刻意不含 script_failure: 场景判定失败 / 契约 FAIL / 编译错误 / CARLA 进程已死
+  # 都是同输入必然同输出的确定性失败, 重试只会白烧时间并掩盖缺陷。
+  # 刻意不含 stuck_or_timeout_failure: 它指向流水线自身的时间行为
+  # (收尾收不回来 / 场景数 x 单场景兜底逼近 timeout), 重放同路径不会变好。
+  # 注意: 不要写成 `retry: 2` 简写 —— 不带 when 时等价于 when: always。
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - scheduler_failure
+      - api_failure
 
 # --------------------------------------------------------------- 1. 契约校验
 contract:
   stage: contract
-  resource_group: carla_sim
+  # 刻意不占 resource_group: carla_sim —— 本 job 只读文件 + 写 ci_out/contract,
+  # 不碰 CARLA / DDS / install 空间。占锁会让 sim 跑批 (5~15 min) 期间所有
+  # 后到 pipeline 的秒级契约校验跟着排队, 表现为"网页点了没反应"。
+  # (build 必须留在锁内: 它写 install/ 而 sim 正在 source 同一个 install/)
   timeout: 10m
   script:
     - set -euo pipefail
     - |
-      echo "== [1/3] 工作区版本 = 本次提交 =="
+      echo "== [1/4] 工作区版本 = 本次提交 =="
       cd "$ASR_WS"
       HARNESS_HEAD=$(git -C src/autoware_srunner rev-parse HEAD)
       if [ "$HARNESS_HEAD" != "$CI_COMMIT_SHA" ]; then
@@ -52,17 +72,28 @@ contract:
       fi
       echo "ok: $HARNESS_HEAD"
     - |
-      echo "== [2/3] 准备干净输出目录 =="
+      echo "== [2/4] 准备干净输出目录 =="
       rm -rf "$CI_OUT/contract" && mkdir -p "$CI_OUT/contract"
     - |
-      echo "== [3/3] 跨仓契约 C1~C7 (FAIL 拦, WARN 只打印) =="
+      echo "== [3/4] 跨仓契约 C1~C7 (FAIL 拦, WARN 只打印) =="
+      set +e
       python3 src/autoware_srunner/autoware_srunner/scenario_contract_check.py \
         --results-root "$CI_OUT/contract" \
         --json "$CI_OUT/contract/contract.json"
+      RC=$?
+      set -e
+      echo "== [4/4] 转 JUnit (只做展示, 不参与判定) =="
+      # 判定仍然只看上面那条命令的退出码; 转换失败不允许改变结论
+      python3 src/autoware_srunner/ci/junit_report.py \
+        --contract "$CI_OUT/contract/contract.json" \
+        --out "$CI_OUT/contract/junit.xml" || true
+      exit "$RC"
   artifacts:
     when: always
     expire_in: 2 weeks
     paths: ["ci_out/contract/"]
+    reports:
+      junit: ci_out/contract/junit.xml
 
 # --------------------------------------------------------------- 2. 构建
 build:
@@ -111,6 +142,29 @@ sim:smoke:
     # rmw_cyclonedds_cpp), 默认 fastrtps 在大拓扑下发现/匹配慢 (transient_local
     # late-joiner 延迟、load_node 概率卡死); 本地 50 条连跑通跑环境即 cyclonedds
     - export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - |
+      echo "== [attempt] 台账: 归档上一次尝试, 记录本次序号 =="
+      # 为什么必须在 rm -rf 之前: 重试时上一次的 launch.log / run_summary.json
+      # 会被下面的 rm 删掉, 且 GitLab 只保留最后一次 attempt 的 artifacts。
+      # 先搬进台账, 才能事后对比"第一次为什么失败"。
+      LEDGER="$CI_OUT/attempts/$CI_PIPELINE_ID"
+      mkdir -p "$LEDGER"
+      SEQ=$(( $(ls -1 "$LEDGER" 2>/dev/null | grep -c '^attempt_') + 1 ))
+      ATT="$LEDGER/$(printf 'attempt_%02d' "$SEQ")"
+      mkdir -p "$ATT"
+      if [ -d "$CI_OUT/sim" ]; then
+        mv "$CI_OUT/sim" "$ATT/prev_sim"
+        echo "  上一次尝试的产物已归档 -> $ATT/prev_sim"
+      fi
+      {
+        echo "pipeline_id=$CI_PIPELINE_ID"
+        echo "job_id=$CI_JOB_ID"
+        echo "job_name=$CI_JOB_NAME"
+        echo "seq=$SEQ"
+        echo "started_at=$(date -Is)"
+      } > "$ATT/meta.env"
+      echo "$ATT" > "$LEDGER/.current_attempt"
+      echo "本次尝试: attempt_$(printf '%02d' "$SEQ") -> $ATT"
     - rm -rf "$CI_OUT/sim" && mkdir -p "$CI_OUT/sim"
     - |
       echo "== [0a/4] 生成 CI 专用编排配置 (关 rviz + 收紧失败兜底) =="
@@ -145,9 +199,25 @@ sim:smoke:
         install/autoware_srunner/lib/autoware_srunner/destroy_actors \
           --host localhost --port 2000 || true
     - |
-      echo "== [1/4] CARLA 预检 (常驻服务, 这里只读不启停) =="
-      env PYTHONPATH="$CARLA_PY:${PYTHONPATH:-}" LD_PRELOAD="$CARLA_CUDART" \
-        python3 -c "import carla;c=carla.Client('localhost',2000);c.set_timeout(5);print('CARLA server', c.get_server_version())"
+      echo "== [1/4] CARLA 预检 (3 次 x 5s, 只吸收刚启动未就绪这类瞬时抖动) =="
+      # 预检失败在 GitLab 眼里是 script_failure, 但它的性质是"外部依赖瞬时不可用":
+      # 在脚本内 15s 内能吸收掉, 就不必让整个 job 重跑 2 分钟。
+      # 若 CARLA 进程已死 (RequestExit 退出), 3 次都会失败 -> 明确报错要求人工启动,
+      # 不靠 job 级 retry 掩盖。
+      CARLA_OK=0
+      for i in 1 2 3; do
+        if env PYTHONPATH="$CARLA_PY:${PYTHONPATH:-}" LD_PRELOAD="$CARLA_CUDART" \
+          python3 -c "import carla;c=carla.Client('localhost',2000);c.set_timeout(5);print('CARLA server', c.get_server_version())"; then
+          CARLA_OK=1; echo "  CARLA 预检第 $i 次通过"; break
+        fi
+        echo "  CARLA 预检第 $i 次失败, 5s 后重试"
+        sleep 5
+      done
+      if [ "$CARLA_OK" != 1 ]; then
+        echo "FAIL: CARLA 预检 3 次全部失败 (localhost:2000)"
+        echo "      -> 在仿真机执行: cd ~/carla && make launch"
+        exit 1
+      fi
     - |
       echo "== [2/4] 跑批 (setsid 独立进程组; 收尾强制收组) =="
       # monitor 退出后 ros2 launch 常因某个子节点不响应 SIGINT 而卡住不返回,
@@ -180,9 +250,28 @@ sim:smoke:
       echo "  编排器已收组 (launch.log $(wc -l < "$CI_OUT/sim/launch.log" 2>/dev/null || echo 0) 行)"
     - |
       echo "== [3/4] 判定 (唯一可信来源 = run_summary.json) =="
+      # 捕获退出码而不是让它直接终止: 后面要先落 JUnit + attempt 台账再退出。
+      # 否则 job 一失败, 页面就只剩下一个人眼看得到的退出码。
+      ATT=$(cat "$CI_OUT/attempts/$CI_PIPELINE_ID/.current_attempt" 2>/dev/null || true)
+      set +e
       python3 src/autoware_srunner/ci/judge_run_summary.py \
         --summary "$CI_OUT/sim/run_summary.json"
-    - echo "== [4/4] 完成 =="
+      RC=$?
+      # JUnit / 台账只做展示与统计, 失败不允许改变结论 (故一律 || true)
+      python3 src/autoware_srunner/ci/junit_report.py \
+        --sim "$CI_OUT/sim/run_summary.json" \
+        --out "$CI_OUT/sim/junit.xml" || true
+      # ATT 为空时宁可不记账, 也不要把 result.json 写到工作区当前目录
+      if [ -n "${ATT:-}" ]; then
+        python3 src/autoware_srunner/ci/record_attempt.py \
+          --attempt-dir "$ATT" \
+          --summary "$CI_OUT/sim/run_summary.json" \
+          --judge-rc "$RC" || true
+      else
+        echo "[warn] 未找到本次 attempt 目录, 跳过台账记录"
+      fi
+      echo "== [4/4] 完成 (judge rc=$RC) =="
+      exit "$RC"
   after_script:
     # 无论 job 怎么结束都补一刀清场 (强杀/超时路径不走 launch 的 OnShutdown)
     - |
@@ -193,4 +282,45 @@ sim:smoke:
   artifacts:
     when: always
     expire_in: 2 weeks
-    paths: ["ci_out/sim/"]
+    paths: ["ci_out/sim/", "ci_out/attempts/"]
+    reports:
+      junit: ci_out/sim/junit.xml
+
+# --------------------------------------------------------------- 4. 汇总指标
+# 第一批指标 (attempt / flaky / 确定重复); 通过率、时长等留给后续。
+# 刻意不占 carla_sim 锁: 只读 ci_out/attempts + 调一次只读 API。
+# 用独立 stage 而不是 needs: sim:smoke 被 rules 跳过时本 job 照样跑 (输出 0 次尝试),
+# needs 写法则会被跳过而无法区分"没跑"和"跑了 0 次"。
+metrics:pipeline:
+  stage: report
+  timeout: 5m
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+      when: always
+  script:
+    - set -o pipefail
+    - cd "$ASR_WS"
+    - mkdir -p "$CI_OUT/metrics"
+    - |
+      # API 对账只是"顺带校验", 参数缺失/网络不通都不能让本 job 失败
+      python3 src/autoware_srunner/ci/collect_attempts.py \
+        --ledger "$CI_OUT/attempts/$CI_PIPELINE_ID" \
+        --attempts-root "$CI_OUT/attempts" \
+        --keep 10 \
+        --out "$CI_OUT/metrics/attempts.txt" \
+        --job-name "sim:smoke" \
+        --api-url "${CI_API_V4_URL:-}" \
+        --project-id "${CI_PROJECT_ID:-}" \
+        --pipeline-id "${CI_PIPELINE_ID:-}" \
+        --token "${CI_JOB_TOKEN:-}"
+    - cat "$CI_OUT/metrics/attempts.txt"
+  artifacts:
+    when: always
+    expire_in: 1 month
+    paths: ["ci_out/metrics/", "ci_out/attempts/"]
+    reports:
+      metrics: ci_out/metrics/attempts.txt
