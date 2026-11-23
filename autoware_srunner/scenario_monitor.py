@@ -50,7 +50,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import String
 
-from carla_ros_scenario_runner_types.msg import CarlaScenarioRunnerScenarioFinished
+from carla_ros_scenario_runner_types.msg import (
+    CarlaScenarioRunnerScenarioFinished, CarlaScenarioRunnerStatus)
 from carla_ros_scenario_runner_types.srv import ExecuteScenario
 from autoware_srunner_msgs.msg import FaultGroup
 from autoware_srunner_msgs.srv import ConfigureFault, ExecuteBatch
@@ -212,6 +213,13 @@ class ScenarioMonitor(Node):
         self._kill_pgid = None
         self._finish_event = threading.Event()
         self._finish_result = 0
+        # 完成信号归属过滤: carla_ros_scenario_runner 处理新请求时先 shutdown 上一条
+        # 子进程, 会用同一条的 scenario_file 发一次 finished; 由于矩阵 50 条复用同一个
+        # xosc 文件, 只比对文件名无法区分 -> 会把上一条的收尾当成本条完成 (pipeline#42
+        # 实测: 每条 e2e_up 后 ~1.0s 就"完成"). 节点在 shutdown(old) 之后才给新 runner
+        # 发 STARTING, 因此: execute 时解除武装, 收到 STARTING 才武装, 未武装期间到达的
+        # finished 一律丢弃。
+        self._sr_armed = False
         self._latest_metrics = {}
         # 单条墙钟起点: run_summary/junit 的 per-case 时长 (仿真时长 ≠ 墙钟)
         self._scn_start_ts = None
@@ -255,6 +263,12 @@ class ScenarioMonitor(Node):
             CarlaScenarioRunnerScenarioFinished,
             self.cyc.get('scenario_finished_topic', '/scenario_runner/scenario_finished'),
             self.on_scenario_finished, fin_qos)
+        # runner 生命周期状态 (TRANSIENT_LOCAL): 用于把"本条的完成"与"上一条被
+        # shutdown 时误发的完成"区分开 (见 _sr_armed)
+        self.create_subscription(
+            CarlaScenarioRunnerStatus,
+            self.cyc.get('scenario_status_topic', '/scenario_runner/status'),
+            self.on_scenario_status, fin_qos)
         self._cycle_pub = self.create_publisher(
             String, self.cyc.get('cycle_topic', '/carla/srunner/cycle'),
             QoSProfile(depth=1))
@@ -294,15 +308,34 @@ class ScenarioMonitor(Node):
             return
         self._interrupted = True
 
+    def on_scenario_status(self, msg):
+        """runner 生命周期状态: 新 runner 进入 STARTING 即"武装"完成信号.
+
+        STARTING 发生在节点 shutdown 上一条子进程之后 (node.run 顺序), 所以旧条
+        被关闭而发出的 finished 会先于本条的 STARTING 到达 -> 武装前一律丢弃.
+        注意不能用 RUNNING 武装: spawn 失败 (result=4) 时 runner 不会打印
+        "ScenarioManager: Running scenario", 永远到不了 RUNNING, 会漏掉真实秒退.
+        """
+        if msg.status == CarlaScenarioRunnerStatus.STARTING:
+            self._sr_armed = True
+
     def on_scenario_finished(self, msg):
-        """逐场景完成状态通道 (需求 6): 校验场景文件后置位完成事件."""
+        """逐场景完成状态通道 (需求 6): 校验文件 + 归属后置位完成事件."""
         cur = self._cur()
         if cur is None:
             return
         if msg.scenario_file != cur['file']:
             return
+        if not self._sr_armed:
+            # 上一条被 shutdown 时用同一 xosc 文件名发来的完成信号: 本条 runner
+            # 尚未 STARTING, 不能当成本条完成 (否则形成"每条 1s 假完成"循环)
+            self.get_logger().warn(
+                '忽略非本次执行的完成信号 (result=%d, runner 未 STARTING): %s'
+                % (msg.result, os.path.basename(msg.scenario_file)))
+            return
         self._finish_result = msg.result
         self._finish_event.set()
+        self._sr_armed = False   # 一条只认一次完成
 
     def on_metrics(self, msg):
         """metrics_collector 发布的当前场景指标 (latch): 保存最新 JSON."""
@@ -1247,6 +1280,10 @@ class ScenarioMonitor(Node):
         req.scenario.name = scn['name']
         req.scenario.scenario_file = scn['file']
         self.get_logger().info('请求执行场景: %s (%s)' % (scn['name'], scn['file']))
+        # 发出前解除武装并清残留完成事件: 只有本条 runner STARTING 后到达的
+        # finished 才是本条结论 (见 _sr_armed / on_scenario_status)
+        self._sr_armed = False
+        self._finish_event.clear()
         self._exec_future = self._exec_cli.call_async(req)
         return True
 
