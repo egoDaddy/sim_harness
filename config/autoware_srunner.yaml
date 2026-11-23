@@ -169,6 +169,12 @@ lifecycle:
     # 否则 lidar 100% 丢点这类"故障本身打瘫被测栈"的用例会吞掉后面全部矩阵项.
     # 连续 N 条都夭折才升级为编排异常并中止整批 (0 = 不因连续夭折中止).
     consecutive_item_error_abort: 3
+    # 收尾后等旧 e2e 的 /api/routing/set_route_points 从 DDS 消失的上限 (秒).
+    # e2e 主进程退出不等于节点已全部下线: 定位挂了时 component_container 可能卡住,
+    # 残留服务会让下一条 0.2s 就误判 e2e 就绪 (见 S_WAIT_E2E_GONE).
+    e2e_gone_wait_s: 10.0
+    # 新 e2e 至少运行 N 秒才认 routing 服务 (避开残留服务的 DDS 窗口).
+    e2e_ready_min_s: 5.0
     rviz: true                    # 循环模式 e2e 每场景重启, rviz 常开会频繁重开窗口, 建议 false
 
 # ---------------- 传感器故障注入 (sensor_fault_injector 常驻节点) ----------------

@@ -62,6 +62,9 @@ S_WAIT_E2E_READY = 'wait_e2e_ready'
 S_WAIT_FINISH = 'wait_finish'
 S_KILL_INJECT = 'kill_inject'
 S_KILL_E2E = 'kill_e2e'
+# 旧 e2e 的 routing 服务从 DDS 消失前不得开下一条: 否则 _routing_service_ready()
+# 会被残留服务骗过, e2e 没起来就 execute_scenario -> result=4 秒退
+S_WAIT_E2E_GONE = 'wait_e2e_gone'
 S_DESTROY = 'destroy'
 S_NEXT = 'next'
 
@@ -206,6 +209,7 @@ class ScenarioMonitor(Node):
         self._interrupted = False
         self._kill_start = None
         self._kill_deadline = 0.0
+        self._kill_pgid = None
         self._finish_event = threading.Event()
         self._finish_result = 0
         self._latest_metrics = {}
@@ -222,6 +226,21 @@ class ScenarioMonitor(Node):
                 self.cyc.get('consecutive_item_error_abort', 3))
         except (TypeError, ValueError):
             self._item_error_limit = 3
+        # e2e 就绪判定的双保险: 新 e2e 至少运行 N 秒才认 routing 服务 (避开
+        # 上一条残留服务的 DDS 窗口), _e2e_start_ts 在 S_START_E2E 记录
+        self._e2e_start_ts = 0.0
+        try:
+            self._e2e_ready_min_s = float(
+                self.cyc.get('e2e_ready_min_s', 5.0))
+        except (TypeError, ValueError):
+            self._e2e_ready_min_s = 5.0
+        # 收尾后等旧 routing 服务从 DDS 消失的上限 (S_WAIT_E2E_GONE)
+        self._gone_deadline = 0.0
+        try:
+            self._e2e_gone_wait_s = float(
+                self.cyc.get('e2e_gone_wait_s', 10.0))
+        except (TypeError, ValueError):
+            self._e2e_gone_wait_s = 10.0
         self.world = None
         # 启动清场: CARLA 常驻时, 上次运行异常退出可能留下 ego/npc 车辆,
         # 占住 xosc 的 spawn 点 -> scenario_runner 报 "Cannot spawn actor" ->
@@ -419,6 +438,7 @@ class ScenarioMonitor(Node):
             self.get_logger().info('========== 场景 %d/%d: %s =========='
                                    % (self._batch_idx + 1, len(self._batch), scn['name']))
             self._e2e_proc = self._spawn_e2e()
+            self._e2e_start_ts = time.monotonic()
             self._deadline = time.monotonic() + float(
                 self.cyc.get('e2e_ready_wait_s', 180.0))
             self.state = S_WAIT_E2E_READY
@@ -429,7 +449,8 @@ class ScenarioMonitor(Node):
                 self.abort_reason = 'autoware e2e 提前退出 (exit %s)' % rc
                 self._start_teardown()
                 return
-            if self._routing_service_ready():
+            if self._routing_service_ready() and (
+                    time.monotonic() - self._e2e_start_ts >= self._e2e_ready_min_s):
                 if self._inject_proc is None:
                     self._publish_cycle('e2e_up')
                     self._inject_proc = self._spawn_inject(self._cur()['file'])
@@ -517,10 +538,27 @@ class ScenarioMonitor(Node):
                               '详见 launch.log 的 [SC] 段 (常见: 残留 actor 占位 -> '
                               'Cannot spawn actor)' % self._finish_result)
                     result_row['abort_reason'] = reason
+                    # 条级不可执行: 归 exit 3 (结论不可靠), 不算整批编排异常
+                    result_row['item_level_error'] = True
                     self.get_logger().error(reason)
                 self.results.append(result_row)
-                # 跑完一条 (无论通过/失败) 就打断"连续中止"计数
-                self._consecutive_item_errors = 0
+                if self._finish_result != 0:
+                    # result!=0 = 这条没跑成 (scenario_runner 崩溃), 计入连续夭折:
+                    # CARLA 死/残留 actor/TM 端口占用时每条都是 4, 不计数就会
+                    # 在几分钟内"跑完"50 条假结果, 把真问题掩盖成大面积失败。
+                    self._consecutive_item_errors += 1
+                    if (self._item_error_limit > 0 and
+                            self._consecutive_item_errors >= self._item_error_limit):
+                        self.abort_reason = (
+                            '连续 %d 条 scenario_runner 异常退出 (result!=0, 上限 %d) '
+                            '-> 疑似环境级故障' % (self._consecutive_item_errors,
+                                                   self._item_error_limit))
+                        self.get_logger().error('循环中止: %s' % self.abort_reason)
+                        self._finalize(1)
+                        return
+                else:
+                    # 跑完一条 (无论通过/失败) 就打断"连续中止"计数
+                    self._consecutive_item_errors = 0
                 self.get_logger().info('场景完成 (result=%s, verdict=%s, wall=%.1fs): %s'
                                        % (self._finish_result, verdict,
                                           result_row['wall_time_s'], scn['file']))
@@ -549,6 +587,24 @@ class ScenarioMonitor(Node):
             if self._kill_proc(self._e2e_proc, 'autoware e2e',
                                float(self.cyc.get('e2e_shutdown_wait_s', 60.0))):
                 self._e2e_proc = None
+                self._gone_deadline = time.monotonic() + self._e2e_gone_wait_s
+                self.state = S_WAIT_E2E_GONE
+
+        elif st == S_WAIT_E2E_GONE:
+            # e2e 主进程退出不等于节点已全部下线: 注入链夭折时 (定位挂了)
+            # component_container 里的节点可能卡住不退, 它们的
+            # /api/routing/set_route_points 服务仍在 DDS 里 -> 下一条
+            # S_WAIT_E2E_READY 会 0.2s 就判 ready -> e2e 没起来就调
+            # execute_scenario -> scenario_runner result=4 秒退
+            # (pipeline#41 实测: 第 11/12/13 条 wall 0.7~0.9s)。
+            # 必须等到服务真的从服务列表消失, 才能开下一条。
+            if not self._routing_service_ready():
+                self.state = S_DESTROY
+            elif time.monotonic() > self._gone_deadline:
+                self.get_logger().warn(
+                    '旧 e2e 的 routing 服务 %.0fs 内未从 DDS 消失, 继续下一条'
+                    ' (可能有残留进程, 看 launch.log 的 SIGKILL 记录)'
+                    % self._e2e_gone_wait_s)
                 self.state = S_DESTROY
 
         elif st == S_DESTROY:
@@ -627,36 +683,60 @@ class ScenarioMonitor(Node):
         self.state = S_KILL_INJECT
 
     def _kill_proc(self, proc, name, timeout):
-        """状态化收尾: SIGINT 进程组 -> 等待退出 -> 超时 SIGKILL."""
-        if proc is None or proc.poll() is not None:
+        """状态化收尾: SIGINT 整组 -> 等整组清空 -> 超时 SIGKILL。
+
+        只等主进程不够: ros2 launch 主进程退出后, component_container 里的节点
+        可能仍存活并继续提供 /api/routing/set_route_points。它们会让下一条的
+        _routing_service_ready() 0.2s 就为 True -> e2e 没起来就 execute_scenario
+        -> scenario_runner result=4 秒退 (pipeline#41 实测第 11/12/13 条 wall 0.7~0.9s)。
+        因此必须等到进程组为空 (killpg(pgid, 0) 抛 ProcessLookupError)。
+        """
+        if proc is None:
             return True
         if self._kill_start is None:
+            try:
+                self._kill_pgid = os.getpgid(proc.pid)
+            except ProcessLookupError:
+                self.get_logger().warn(
+                    '收尾: %s 进程组已不存在 (主进程已被回收)' % name)
+                return True
             self.get_logger().info('收尾: SIGINT -> %s (pid %d)' % (name, proc.pid))
             self._kill_start = time.monotonic()
             self._kill_deadline = self._kill_start + timeout
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                os.killpg(self._kill_pgid, signal.SIGINT)
             except ProcessLookupError:
                 return True
             return False
         try:
-            proc.wait(timeout=0.1)
-            self._kill_start = None
-            return True
+            proc.wait(timeout=0.1)   # 先 reap 主进程 (避免僵尸被当成存活)
         except subprocess.TimeoutExpired:
-            if time.monotonic() > self._kill_deadline:
-                self.get_logger().warn('收尾: %s SIGINT 超时, 升级 SIGKILL' % name)
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    pass
-                self._kill_start = None
-                return True
-            return False
+            pass
+        group_alive = True
+        try:
+            os.killpg(self._kill_pgid, 0)
+        except ProcessLookupError:
+            group_alive = False
+        if proc.poll() is not None and not group_alive:
+            self._kill_start = None
+            self._kill_pgid = None
+            return True
+        if time.monotonic() > self._kill_deadline:
+            self.get_logger().warn(
+                '收尾: %s SIGINT 超时 (主进程%s), 升级 SIGKILL 整组'
+                % (name, '已退' if proc.poll() is not None else '未退'))
+            try:
+                os.killpg(self._kill_pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            self._kill_start = None
+            self._kill_pgid = None
+            return True
+        return False
 
     def _finalize(self, code):
         if self.done:
@@ -835,9 +915,10 @@ class ScenarioMonitor(Node):
     def _load_scenario_verdict(self, finish_result):
         """解析场景判定 JSON (scenario_runner --json 落盘), 返回 (verdict, criteria).
 
-        finish_result=0 (STOPPED) 时读 results_dir 下最新 JSON (排除 run_summary.json);
-        finish_result!=0 (ERROR) 时子进程异常退出, 判定未知, 不读文件。
-        无判据 (xosc 无 criteria_ 条件, scenario_runner 不落盘) -> NO_CRITERIA。
+        finish_result=0 (STOPPED) 时读本场景落盘的 JSON (按 mtime 过滤到
+        _scn_start_ts 之后, 排除 run_summary.json);finish_result!=0 (ERROR)
+        时子进程异常退出, 判定未知, 不读文件。
+        无本场景判据 (xosc 无 criteria_ 条件 / 场景没跑起来) -> NO_CRITERIA。
         """
         if finish_result != 0:
             return 'ERROR', []
@@ -850,7 +931,19 @@ class ScenarioMonitor(Node):
                      if f.endswith('.json') and f != 'run_summary.json']
             if not files:
                 return 'NO_CRITERIA', []
-            latest = max(files, key=os.path.getmtime)
+            # 只接受本场景开始之后落盘的判定: 目录里混着历史场景的文件,
+            # 若本场景根本没跑起来 (application 秒退), 直接取 mtime 最新会
+            # 把上一条的结论偷过来 (pipeline#41 实测: wall=0.7s 却报 FAILURE)。
+            # 2s 容差覆盖文件系统时间粒度与首帧写盘抖动。
+            cutoff = (self._scn_start_ts or 0.0) - 2.0
+            fresh = [f for f in files if os.path.getmtime(f) >= cutoff]
+            if not fresh:
+                newest = max(files, key=os.path.getmtime)
+                self.get_logger().warn(
+                    '本场景未产出判定 JSON (最新 %s 早于场景开始), 判 NO_CRITERIA'
+                    % os.path.basename(newest))
+                return 'NO_CRITERIA', []
+            latest = max(fresh, key=os.path.getmtime)
             with open(latest) as f:
                 data = json.load(f)
         except (OSError, ValueError) as e:  # pylint: disable=broad-except
