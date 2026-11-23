@@ -234,7 +234,7 @@ sim:smoke:
           scenario_root:="$ASR_WS/scenarios" \
           fault_root:="$ASR_WS/fault" \
           results_dir:="$CI_OUT/sim" \
-          xosc_list:="${XOSC_LIST:-xosc_list.json}" \
+          fault_matrix:="${FAULT_MATRIX:-lidar_fault_matrix.json}" \
           orchestration:=auto \
         > "$CI_OUT/sim/launch.log" 2>&1 &
       LPID=$!
