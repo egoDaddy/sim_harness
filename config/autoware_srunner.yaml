@@ -165,6 +165,10 @@ lifecycle:
     e2e_shutdown_wait_s: 60.0      # SIGINT e2e 后等待优雅退出 (超时 SIGKILL)
     inject_kill_wait_s: 10.0       # SIGINT 注入链后等待退出 (超时 SIGKILL)
     scenario_timeout_s: 900.0      # 单场景兜底超时 (门控 300s + 场景 60s 仿真时长按 ~1.9x 墙钟换算 + 余量)
+    # 注入链夭折 (e2e 仍存活) 的条级处理: 当前条记 ERROR 后继续队列,
+    # 否则 lidar 100% 丢点这类"故障本身打瘫被测栈"的用例会吞掉后面全部矩阵项.
+    # 连续 N 条都夭折才升级为编排异常并中止整批 (0 = 不因连续夭折中止).
+    consecutive_item_error_abort: 3
     rviz: true                    # 循环模式 e2e 每场景重启, rviz 常开会频繁重开窗口, 建议 false
 
 # ---------------- 传感器故障注入 (sensor_fault_injector 常驻节点) ----------------

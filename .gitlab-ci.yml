@@ -28,7 +28,12 @@ variables:
   CARLA_CUDART: "/usr/local/cuda/lib64/libcudart.so"
   # pipeline 产物落在 CI_PROJECT_DIR 内, artifacts 才能被 runner 收集
   CI_OUT: "$CI_PROJECT_DIR/ci_out"
-  SIM_TIMEOUT: "1200"          # 20 min 墙钟兜底 (失败路径已收紧, 到不了这个数)
+  # 70 min 墙钟兜底。推导: lidar_fault_matrix.json 固定 50 条 (1 场景 x 50 故障
+  # 组合), pipeline#40 的 launch.log 相邻场景时间戳实测 64.6~75.0s/条 (均值 ~67s),
+  # 50 x 67s ~ 3350s, 再留 ~25% 给启动清场 / 单条偏慢 / 收尾。
+  # 注意: 这个值必须 > 单条偏慢时的累计, 否则会出现"跑到第 20 条被 timeout 掐断"
+  # 又被误读成"批量中止没修好"; 同时本 job 的 timeout 必须 > 本值 + 180。
+  SIM_TIMEOUT: "4200"
 
 default:
   tags: [carla-sim]            # 只匹配仿真机上的 shell runner (docker1 不接)
@@ -122,7 +127,10 @@ sim:smoke:
   stage: sim
   resource_group: carla_sim
   needs: [build]
-  timeout: 50m
+  # 80 min = SIM_TIMEOUT(4200s) + 180s 收组余量 + 预检/after_script。
+  # 本值若被项目级 Settings>CI/CD>Timeout 压小, GitLab 会先取消 job 并报
+  # stuck_or_timeout_failure, 此时需同步调大项目级 timeout。
+  timeout: 80m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
@@ -179,7 +187,7 @@ sim:smoke:
       sed -i -E 's/^([[:space:]]{4})rviz: true/\1rviz: false/' "$CI_CFG"
       # 冒烟调试提速: 下面四个只是"失败兜底上限", 正常路径走到即结束, 不受影响.
       # 场景 Act 仿真时长 60s (StopTrigger), 按 1.9x 墙钟换算 ~114s,
-      # 420s 已留约 4x 余量; 注入链天折由 monitor 立即中止 (不再等满).
+      # 420s 已留约 4x 余量; 注入链夭折由 monitor 立即中止 (不再等满).
       sed -i -E 's/scenario_timeout_s: [0-9.]+/scenario_timeout_s: 420.0/' "$CI_CFG"
       sed -i -E 's/e2e_ready_wait_s: [0-9.]+/e2e_ready_wait_s: 120.0/' "$CI_CFG"
       sed -i -E 's/e2e_shutdown_wait_s: [0-9.]+/e2e_shutdown_wait_s: 30.0/' "$CI_CFG"

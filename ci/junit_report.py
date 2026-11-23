@@ -39,10 +39,19 @@ def _new_suite(root, name):
                          errors='0', skipped='0', time='0')
 
 
-def _add_case(suite, classname, name):
-    """建 testcase 并同步 tests 计数 (统计口径在这里统一收口)."""
+def _add_case(suite, classname, name, time_s=0.0):
+    """建 testcase 并同步 tests 计数 (统计口径在这里统一收口).
+
+    time_s 必须是真实耗时: 之前固定 time='0' 导致 GitLab Tests 页面里每条用例
+    都是 0s (只有 suite 汇总时长真实)。
+    """
     suite.set('tests', str(int(suite.get('tests')) + 1))
-    return ET.SubElement(suite, 'testcase', classname=classname, name=name, time='0')
+    try:
+        elapsed = max(0.0, float(time_s or 0.0))
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    return ET.SubElement(suite, 'testcase', classname=classname, name=name,
+                         time='%.3f' % elapsed)
 
 
 def _bump(suite, attr):
@@ -79,9 +88,11 @@ def _fill_contract(suite, path):
             node = ET.SubElement(case, 'failure', message=_short(msg, 200))
             node.text = msg
         elif level == 'WARN':
-            _bump(suite, 'skipped')
-            node = ET.SubElement(case, 'skipped', message=_short(msg, 200))
-            node.text = msg
+            # WARN = 已执行但有风险, 不是"未执行". 映射成 <skipped> 会让 GitLab
+            # 显示为 skipped, 误导成"校验被跳过". 保持用例通过, 告警写进
+            # system-out (只展示, 判定仍由 contract 退出码决定).
+            out = ET.SubElement(case, 'system-out')
+            out.text = _clean('[WARN] ' + msg)
 
 
 # ----------------------------------------------------------------------- sim
@@ -146,7 +157,9 @@ def _fill_sim(suite, path):
         bad = [str(c.get('name', '?')) for c in criteria
                if isinstance(c, dict) and c.get('success') is False]
         name = _short(sc.get('name') or '?', 120)
-        case = _add_case(suite, 'sim.scenario', name)
+        # 单条墙钟耗时由 monitor 落盘 (scenarios[].wall_time_s); 缺失时退回 0
+        case = _add_case(suite, 'sim.scenario', name,
+                         sc.get('wall_time_s', 0.0))
 
         kind = _VERDICT_KIND.get(result, 'error')
         if kind == 'failure':
@@ -163,7 +176,12 @@ def _fill_sim(suite, path):
                                   sc.get('abort_reason') or '-'))
 
         out = ET.SubElement(case, 'system-out')
-        out.text = _clean('\n'.join(_criteria_lines(criteria)) or 'criteria=-')
+        try:
+            wall = max(0.0, float(sc.get('wall_time_s') or 0.0))
+        except (TypeError, ValueError):
+            wall = 0.0
+        out.text = _clean('wall_time_s=%.3f\n%s'
+                          % (wall, '\n'.join(_criteria_lines(criteria)) or 'criteria=-'))
 
 
 # ---------------------------------------------------------------------- main

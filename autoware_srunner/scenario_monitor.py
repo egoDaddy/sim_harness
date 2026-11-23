@@ -209,6 +209,19 @@ class ScenarioMonitor(Node):
         self._finish_event = threading.Event()
         self._finish_result = 0
         self._latest_metrics = {}
+        # 单条墙钟起点: run_summary/junit 的 per-case 时长 (仿真时长 ≠ 墙钟)
+        self._scn_start_ts = None
+        # 注入链夭折的条级处理 (不牵连整批): 见 S_WAIT_FINISH / S_NEXT
+        self._item_error_reason = None
+        # 注入链是否应常驻 (有 trajectory_publisher): 无 ego_trajectory 声明时
+        # wait_for_ready && set_route 正常完成即 exit 0, 不能当夭折
+        self._inject_expect_linger = True
+        self._consecutive_item_errors = 0
+        try:
+            self._item_error_limit = int(
+                self.cyc.get('consecutive_item_error_abort', 3))
+        except (TypeError, ValueError):
+            self._item_error_limit = 3
         self.world = None
         # 启动清场: CARLA 常驻时, 上次运行异常退出可能留下 ego/npc 车辆,
         # 占住 xosc 的 spawn 点 -> scenario_runner 报 "Cannot spawn actor" ->
@@ -400,6 +413,8 @@ class ScenarioMonitor(Node):
 
         elif st == S_START_E2E:
             self._batch_idx += 1
+            self._scn_start_ts = None
+            self._item_error_reason = None
             scn = self._cur()
             self.get_logger().info('========== 场景 %d/%d: %s =========='
                                    % (self._batch_idx + 1, len(self._batch), scn['name']))
@@ -422,6 +437,8 @@ class ScenarioMonitor(Node):
                 # 成功后才开场景; 无故障组直接执行
                 if self._configure_fault(self._cur()):
                     if self._call_execute_scenario(self._cur()):
+                        if self._scn_start_ts is None:
+                            self._scn_start_ts = time.time()
                         self._deadline = time.monotonic() + float(
                             self.cyc.get('scenario_timeout_s', 900.0))
                         self.state = S_WAIT_FINISH
@@ -439,14 +456,34 @@ class ScenarioMonitor(Node):
             # 没有 route/轨迹 ego 不可能动, 继续等到 scenario_timeout 纯属空耗
             # (job=93 实证: set_route 15 次重试耗尽后仍空等 ~750s 才超时).
             # trajectory_publisher 是常驻发布器 (rclpy.spin), 正常不会主动退出;
-            # 因此这里的退出只可能是链路失败 -> 立即收尾并把退出码写进 abort_reason.
+            # 因此这里的退出只可能是链路失败 -> 立即收尾.
+            # 但要区分两种性质:
+            #   e2e 也死了 -> 真编排异常, 整批中止;
+            #   e2e 还活着 -> 多半是注入故障本身打瘫了被测栈 (如 lidar 100% 丢点
+            #     导致定位起不来), 属于该条用例的结论, 记 ERROR 后继续跑后续矩阵项.
+            #     否则一条不可跑用例会吞掉后面全部覆盖 (pipeline#40 实证: 50 条
+            #     只跑到第 10 条 lidar_dropout_r100 就整批退出).
             if self._inject_proc is not None and self._inject_proc.poll() is not None:
                 irc = self._inject_proc.returncode
                 self._inject_proc = None
-                self.abort_reason = 'ego 注入链提前退出 (exit %s, 见 launch.log)' % irc
-                self.get_logger().error(self.abort_reason)
-                self._start_teardown()
-                return
+                # 无 ego_trajectory 声明的注入链 (wait_for_ready && set_route) 任务完成
+                # 就会 exit 0, 场景由 autoware 自规划驱动 -> 不是夭折, 继续等 finish.
+                finished_ok = (irc == 0 and not self._inject_expect_linger)
+                # finish 信号已到: 场景已完成, 注入链退出属正常收尾,
+                # 交给下面的 finish 分支结算, 不能误记成条级 ERROR.
+                if not finished_ok and not self._finish_event.is_set():
+                    e2e_rc = self._e2e_proc.poll() if self._e2e_proc is not None else -1
+                    reason = 'ego 注入链提前退出 (exit %s, 见 launch.log)' % irc
+                    if e2e_rc is not None:
+                        self.abort_reason = (reason +
+                                             '; autoware e2e 同时退出 (exit %s)' % e2e_rc)
+                        self.get_logger().error(self.abort_reason)
+                    else:
+                        self._item_error_reason = reason
+                        self.get_logger().error(
+                            '%s -> 本条记 ERROR 并继续队列 (e2e 仍存活)' % reason)
+                    self._start_teardown()
+                    return
             if self._exec_future is not None and self._exec_future.done():
                 resp = self._exec_future.result()
                 self._exec_future = None
@@ -465,6 +502,7 @@ class ScenarioMonitor(Node):
                     'verdict': verdict,
                     'criteria': criteria,
                     'metrics': dict(self._latest_metrics),
+                    'wall_time_s': self._scn_wall_s(),
                 }
                 if scn.get('id'):
                     result_row['id'] = scn['id']
@@ -481,8 +519,11 @@ class ScenarioMonitor(Node):
                     result_row['abort_reason'] = reason
                     self.get_logger().error(reason)
                 self.results.append(result_row)
-                self.get_logger().info('场景完成 (result=%s, verdict=%s): %s'
-                                       % (self._finish_result, verdict, scn['file']))
+                # 跑完一条 (无论通过/失败) 就打断"连续中止"计数
+                self._consecutive_item_errors = 0
+                self.get_logger().info('场景完成 (result=%s, verdict=%s, wall=%.1fs): %s'
+                                       % (self._finish_result, verdict,
+                                          result_row['wall_time_s'], scn['file']))
                 self._start_teardown()
             elif time.monotonic() > self._deadline:
                 self.abort_reason = '场景执行超时 (%.0fs)'
@@ -548,6 +589,24 @@ class ScenarioMonitor(Node):
                                         % self.abort_reason)
                 self._append_abort_row(self.abort_reason)
                 self.abort_reason = None
+            if self._item_error_reason is not None:
+                # 单条用例夭折 (e2e 仍存活): 记 ERROR 行后继续, 不牺牲后续覆盖.
+                # 连续 N 条都夭折才升级为编排异常, 防止 CARLA/DDS 真故障空转整批.
+                reason = self._item_error_reason
+                self._item_error_reason = None
+                self._append_abort_row(reason)
+                self._consecutive_item_errors += 1
+                self.get_logger().error('场景中止: %s (记 ERROR, 继续队列 %d/%d)'
+                                        % (reason, self._batch_idx + 1, len(self._batch)))
+                if (self._item_error_limit > 0 and
+                        self._consecutive_item_errors >= self._item_error_limit):
+                    self.abort_reason = ('连续 %d 条用例夭折 (注入链提前退出, 上限 %d) -> '
+                                         '疑似环境级故障' % (
+                                             self._consecutive_item_errors,
+                                             self._item_error_limit))
+                    self.get_logger().error('循环中止: %s' % self.abort_reason)
+                    self._finalize(1)
+                    return
             if self._batch_idx + 1 < len(self._batch):
                 self.state = S_START_E2E
             elif self.orch == 'manual':
@@ -606,8 +665,15 @@ class ScenarioMonitor(Node):
         self.exit_code = code
         self._write_run_summary()
 
+    def _scn_wall_s(self):
+        """当前场景已耗时 (墙钟秒); 场景尚未启动时返回 0."""
+        if self._scn_start_ts is None:
+            return 0.0
+        return round(max(0.0, time.time() - self._scn_start_ts), 3)
+
     def _append_abort_row(self, reason):
-        """manual 模式当前项执行中止: 记 verdict=ERROR 行 (不退出, 继续队列)."""
+        """当前项执行中止 (manual 任意原因 / auto 注入链夭折): 记 verdict=ERROR 行,
+        不退出, 继续队列."""
         cur = self._cur()
         if cur is None:
             return
@@ -618,6 +684,8 @@ class ScenarioMonitor(Node):
             'verdict': 'ERROR',
             'criteria': [],
             'metrics': dict(self._latest_metrics),
+            'wall_time_s': self._scn_wall_s(),
+            'item_level_error': True,
             'abort_reason': reason,
         }
         if cur.get('id'):
@@ -796,16 +864,21 @@ class ScenarioMonitor(Node):
         """exit code 分层 (优先级从高到低):
         1 = 编排异常 (e2e 死/服务拒收/墙钟超时/信号, 由 abort_reason 路径保证);
         2 = 测试失败 (任一场景 verdict=FAILURE);
-        3 = 结论不可靠 (NO_CRITERIA/TIMEOUT/UNKNOWN);
-        0 = 全部通过。"""
-        for r in self.results:
-            if r['verdict'] == 'ERROR':
-                return 1
+        3 = 结论不可靠 (NO_CRITERIA/TIMEOUT/UNKNOWN, 或条级 ERROR: 该用例
+            自身跑不起来, 例如 lidar 100% 去点把定位打瘫);
+        0 = 全部通过。
+
+        条级 ERROR (item_level_error) 刻意不算 1: 它不牵连整批, 如果把整批判成
+        "编排异常" 会盖掉"9 条碰撞 FAILURE"这类真实结论。"""
+        if any(r['verdict'] == 'ERROR' and not r.get('item_level_error')
+               for r in self.results):
+            return 1
         for r in self.results:
             if r['verdict'] == 'FAILURE':
                 return 2
         for r in self.results:
-            if r['verdict'] in ('NO_CRITERIA', 'TIMEOUT', 'UNKNOWN'):
+            if r['verdict'] in ('NO_CRITERIA', 'TIMEOUT', 'UNKNOWN') or (
+                    r['verdict'] == 'ERROR' and r.get('item_level_error')):
                 return 3
         return 0
 
@@ -840,6 +913,7 @@ class ScenarioMonitor(Node):
                 'xosc_list': self.cyc.get('xosc_list', ''),
                 'fault_matrix': self.cyc.get('fault_matrix', ''),
                 'scenario_count': len(self.results),
+                'queue_total': len(self._batch),
                 'output_dir': results_dir,
                 'abort_reason': self.abort_reason,
             },
@@ -862,8 +936,10 @@ class ScenarioMonitor(Node):
                     },
                     'verdict': {'result': r['verdict'], 'criteria': r['criteria']},
                     'metrics': r.get('metrics', {}),
+                    'wall_time_s': r.get('wall_time_s', 0.0),
                     'fault': r.get('fault'),
                     'abort_reason': r.get('abort_reason'),
+                    'item_level_error': bool(r.get('item_level_error')),
                 }
                 for r in self.results
             ],
@@ -959,6 +1035,8 @@ class ScenarioMonitor(Node):
         if not self._resolve_ego_trajectory(scn_file):
             # 无 ego_trajectory 声明: 跳过 trajectory_publisher (需求 19),
             # autoware 自身规划链驱动; set_route 仍执行 (解锁 scenario_selector)
+            # 本链完成后即退出, 故不常驻 (S_WAIT_FINISH 据此区分"完成"与"夭折")
+            self._inject_expect_linger = False
             cmd = cmd_prefix + cmd_ready + ' && ' + cmd_route
             self.get_logger().info(
                 '拉起 ego 注入链 (无 ego_trajectory 声明, 跳过 trajectory_publisher)')
@@ -968,6 +1046,8 @@ class ScenarioMonitor(Node):
         ctrl_topic = str(self.inj.get('controller_topic', '') or '').strip()
         ctrl_arg = ('--controller-topic %s' % ctrl_topic) if ctrl_topic else \
             '--no-controller-topic'
+        # trajectory_publisher 是常驻发布器, 正常只会在 SIGINT 时退出
+        self._inject_expect_linger = True
         # controller 加速上限覆盖 (每场景新 autoware 参数复位, 需重设):
         # 后台等待 controller_node_exe 上线后 ros2 param set
         max_acc = self.inj.get('max_acc_override', 6.0)
