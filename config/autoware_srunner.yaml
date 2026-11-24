@@ -95,6 +95,13 @@ ego_injection:
   # controller_node_exe 上线后覆盖为 6.0 (对齐 model3 实测 ~6.4 m/s^2);
   # 置空/0 则跳过覆盖
   max_acc_override: 6.0
+  # 紧急制动取消注入: 订阅 MRM 状态, behavior=EMERGENCY_STOP 且 state 进入
+  # OPERATING/SUCCEEDED/FAILED 时立即 SIGINT 取消注入链 (停发轨迹)。
+  # 目的: 静态注入轨迹穿过障碍物, 刹停后继续发布会让 MRM 一解除就重新加速冲出;
+  # 停注后 planning 失输入 -> autonomous 不可用 -> MRM 不解除 -> 车辆保持停止。
+  # 置 false 则恢复“注满全程”的旧行为 (仅调试用)。
+  cancel_inject_on_emergency: true
+  mrm_state_topic: "/system/fail_safe/mrm_state"
   # 触发信号 (npc_ready_trigger 发布, latch): set_route/trajectory_publisher 的前置条件
   ready_topic: "/carla/srunner/npc_ready"
   wait_timeout_s: 300.0

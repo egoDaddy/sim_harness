@@ -14,6 +14,7 @@
   <exec_depend>carla_ros_scenario_runner_types</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>autoware_adapi_v1_msgs</exec_depend>
   <!-- 故障注入接口 (FaultGroup.msg / ConfigureFault.srv) 在 ament_cmake 子包 -->
   <depend>autoware_srunner_msgs</depend>
 

@@ -50,6 +50,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import String
 
+from autoware_adapi_v1_msgs.msg import MrmState
 from carla_ros_scenario_runner_types.msg import (
     CarlaScenarioRunnerScenarioFinished, CarlaScenarioRunnerStatus)
 from carla_ros_scenario_runner_types.srv import ExecuteScenario
@@ -115,6 +116,12 @@ class ScenarioMonitor(Node):
         self.lc = cfg['lifecycle']
         self.cyc = self.lc.get('cycle', {})
         self.ego_role_name = cfg.get('ego_role_name', 'ego_vehicle')
+        # 紧急制动取消注入: MRM EMERGENCY_STOP 一经触发即停发注入轨迹 (订阅 mrm_state)。
+        # 这是替代 vehicle_cmd_gate 侧 hold 补丁的方案: 不动被测源码, 由编排器决定停注。
+        self.emergency_cancel_inject = bool(
+            self.inj.get('cancel_inject_on_emergency', True))
+        self.emergency_topic = str(
+            self.inj.get('mrm_state_topic', '/system/fail_safe/mrm_state'))
         # 故障注入配置 (矩阵加载/校验与 configure 服务共用, 必须先于矩阵加载赋值)
         self.fi_cfg = cfg.get('sensor_fault_injector', {})
 
@@ -228,6 +235,10 @@ class ScenarioMonitor(Node):
         # 注入链是否应常驻 (有 trajectory_publisher): 无 ego_trajectory 声明时
         # wait_for_ready && set_route 正常完成即 exit 0, 不能当夭折
         self._inject_expect_linger = True
+        # 紧急制动已取消注入 (S_START_E2E 每场景复位; 见 on_mrm_state)
+        self._inject_cancelled = False
+        # 取消信号只发一次 (S_WAIT_FINISH 每拍都会补刀, 否则日志刷重复行)
+        self._inject_cancel_signaled = False
         self._consecutive_item_errors = 0
         try:
             self._item_error_limit = int(
@@ -291,6 +302,10 @@ class ScenarioMonitor(Node):
         self.create_subscription(
             String, self.get_parameter('metrics_topic').value,
             self.on_metrics, fin_qos)
+        # 紧急制动信号 (MRM 状态机): 触发即取消轨迹注入
+        if self.emergency_cancel_inject:
+            self.create_subscription(
+                MrmState, self.emergency_topic, self.on_mrm_state, 1)
 
         # ---- CARLA (收尾销毁 actors 用) ----
         self.create_timer(5.0, self._retry_connect)
@@ -343,6 +358,43 @@ class ScenarioMonitor(Node):
             self._latest_metrics = json.loads(msg.data)
         except (TypeError, ValueError) as e:  # pylint: disable=broad-except
             self.get_logger().warn('metrics JSON 解析失败: %s' % e)
+
+    def on_mrm_state(self, msg):
+        """MRM 紧急制动触发 -> 取消轨迹注入 (替代 vehicle_cmd_gate 侧 hold 补丁).
+
+        注入轨迹是按场景静态生成的巡航曲线 (终点在障碍物之后), 紧急制动刹停后
+        若继续发布, MRM 一旦解除 controller 立刻按轨迹要求的速度重新加速 -> 刚停
+        住的车再次冲出并追尾。取消注入后 planning 链路失去输入, 轨迹超时使
+        autonomous 不可用, mrm_handler 的 isEmergency() 持续为真 (不会回到
+        NORMAL), 车辆被 /system/emergency/control_cmd 的急停指令保持在停止态。
+        """
+        if self._inject_cancelled:
+            return
+        if msg.behavior != MrmState.EMERGENCY_STOP:
+            return
+        if msg.state not in (MrmState.MRM_OPERATING, MrmState.MRM_SUCCEEDED,
+                             MrmState.MRM_FAILED):
+            return
+        self._inject_cancelled = True
+        self.get_logger().warn(
+            'MRM 紧急制动触发 (state=%d, behavior=%d) -> 取消轨迹注入'
+            % (msg.state, msg.behavior))
+        self._cancel_inject()
+
+    def _cancel_inject(self):
+        """SIGINT 取消 ego 注入链 (幂等; 不置 None, 仍由状态机回收避免僵尸)."""
+        proc = self._inject_proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        except ProcessLookupError:
+            return
+        # 进程组死于 SIGINT 有 0.1~0.5s 延迟, S_WAIT_FINISH 每拍会再补刀;
+        # 重复 killpg 无害, 但重复打 WARN 会让人误以为取消了多次
+        if not self._inject_cancel_signaled:
+            self._inject_cancel_signaled = True
+            self.get_logger().warn('轨迹注入链已取消 (pid %d)' % proc.pid)
 
     # ------------------------------------------------------------ 执行队列 (manual)
     def _cur(self):
@@ -467,6 +519,8 @@ class ScenarioMonitor(Node):
             self._batch_idx += 1
             self._scn_start_ts = None
             self._item_error_reason = None
+            self._inject_cancelled = False
+            self._inject_cancel_signaled = False
             scn = self._cur()
             self.get_logger().info('========== 场景 %d/%d: %s =========='
                                    % (self._batch_idx + 1, len(self._batch), scn['name']))
@@ -517,12 +571,20 @@ class ScenarioMonitor(Node):
             #     导致定位起不来), 属于该条用例的结论, 记 ERROR 后继续跑后续矩阵项.
             #     否则一条不可跑用例会吞掉后面全部覆盖 (pipeline#40 实证: 50 条
             #     只跑到第 10 条 lidar_dropout_r100 就整批退出).
+            # 注入取消早于 spawn 的极小时间窗: 补一刀, 保证后续不会继续发布轨迹
+            if self._inject_cancelled:
+                self._cancel_inject()
             if self._inject_proc is not None and self._inject_proc.poll() is not None:
                 irc = self._inject_proc.returncode
                 self._inject_proc = None
+                if self._inject_cancelled:
+                    self.get_logger().info(
+                        '注入链已按紧急制动要求退出 (exit %s), 场景继续等待 runner 判定'
+                        % irc)
                 # 无 ego_trajectory 声明的注入链 (wait_for_ready && set_route) 任务完成
                 # 就会 exit 0, 场景由 autoware 自规划驱动 -> 不是夭折, 继续等 finish.
-                finished_ok = (irc == 0 and not self._inject_expect_linger)
+                finished_ok = (irc == 0 and not self._inject_expect_linger) \
+                    or self._inject_cancelled
                 # finish 信号已到: 场景已完成, 注入链退出属正常收尾,
                 # 交给下面的 finish 分支结算, 不能误记成条级 ERROR.
                 if not finished_ok and not self._finish_event.is_set():
