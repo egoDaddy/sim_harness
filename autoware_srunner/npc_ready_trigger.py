@@ -24,7 +24,7 @@ from std_msgs.msg import Bool, String
 
 from carla_ros_scenario_runner_types.msg import CarlaScenarioRunnerStatus
 
-import carla
+from autoware_srunner.carla_link import CarlaLink
 
 
 class NpcReadyTrigger(Node):
@@ -64,14 +64,10 @@ class NpcReadyTrigger(Node):
                                  self.get_parameter('cycle_topic').value,
                                  self.on_cycle, 1)
 
-        try:
-            self.client = carla.Client(self.get_parameter('host').value,
-                                       self.get_parameter('port').value)
-            self.client.set_timeout(10.0)
-            self.world = self.client.get_world()
-        except Exception as e:  # pylint: disable=broad-except
-            self.get_logger().error('CARLA 连接失败: %s' % e)
-            raise
+        # CARLA 连接放后台线程重试: launch 与服务器加载地图并行时早期连不上是常态,
+        # 一次性 raise 退出会让 npc_ready 永不 latch -> 注入链空等到超时 (见 carla_link)
+        self.link = CarlaLink(self, self.get_parameter('host').value,
+                              self.get_parameter('port').value).start()
 
         rate = float(self.get_parameter('poll_rate_hz').value)
         self.create_timer(1.0 / rate, self.poll_actors)
@@ -97,8 +93,11 @@ class NpcReadyTrigger(Node):
     def poll_actors(self):
         if self.triggered or not self._started:
             return
+        world = self.link.world
+        if world is None:  # 尚未连上 CARLA (carla_link 后台重试中)
+            return
         try:
-            actors = self.world.get_actors()
+            actors = world.get_actors()
             for actor in list(actors.filter('vehicle.*')) + list(actors.filter('walker.*')):
                 if not actor.is_alive:
                     continue

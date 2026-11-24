@@ -26,11 +26,12 @@ import json
 import math
 import threading
 
-import carla
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String
+
+from autoware_srunner.carla_link import CarlaLink
 
 
 class MetricsCollector(Node):
@@ -62,14 +63,10 @@ class MetricsCollector(Node):
                                  self.get_parameter('cycle_topic').value,
                                  self.on_cycle, 1)
 
-        try:
-            self.client = carla.Client(self.get_parameter('host').value,
-                                       self.get_parameter('port').value)
-            self.client.set_timeout(10.0)
-            self.world = self.client.get_world()
-        except Exception as e:  # pylint: disable=broad-except
-            self.get_logger().error('CARLA 连接失败: %s' % e)
-            raise
+        # CARLA 连接放后台线程重试 (启动早期服务器还在加载地图, 见 carla_link);
+        # 一次性 raise 退出会让碰撞指标永久缺失 (collision_speed_kph 无法采集)
+        self.link = CarlaLink(self, self.get_parameter('host').value,
+                              self.get_parameter('port').value).start()
 
         rate = float(self.get_parameter('poll_rate_hz').value)
         self.create_timer(1.0 / rate, self.poll_ego)
@@ -128,8 +125,11 @@ class MetricsCollector(Node):
         if self._collision_sensor is not None and self._collision_sensor.is_alive:
             return
         self._collision_sensor = None
+        world = self.link.world
+        if world is None:  # 尚未连上 CARLA (carla_link 后台重试中)
+            return
         try:
-            actors = self.world.get_actors()
+            actors = world.get_actors()
             ego = None
             for v in actors.filter('vehicle.*'):
                 if v.is_alive and v.attributes.get('role_name') == self.ego_role_name:

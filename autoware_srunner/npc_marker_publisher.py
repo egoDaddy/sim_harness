@@ -9,12 +9,13 @@
 """
 import math
 
-import carla
 import rclpy
 from geometry_msgs.msg import Quaternion
 from rclpy.node import Node
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
+
+from autoware_srunner.carla_link import CarlaLink
 
 
 def quat_from_yaw(yaw):
@@ -53,14 +54,9 @@ class NpcMarkerPublisher(Node):
         self.color_wheel = rgba(self.get_parameter('wheel_color').value)
         self.color_walker = rgba(self.get_parameter('walker_color').value)
 
-        try:
-            self.client = carla.Client(self.get_parameter('host').value,
-                                       self.get_parameter('port').value)
-            self.client.set_timeout(10.0)
-            self.world = self.client.get_world()
-        except Exception as e:  # pylint: disable=broad-except
-            self.get_logger().error('CARLA 连接失败: %s' % e)
-            raise
+        # CARLA 连接放后台线程重试 (启动早期服务器还在加载地图, 见 carla_link)
+        self.link = CarlaLink(self, self.get_parameter('host').value,
+                              self.get_parameter('port').value).start()
 
         self.pub = self.create_publisher(MarkerArray, self.get_parameter('topic').value, 10)
         rate = float(self.get_parameter('rate_hz').value)
@@ -74,8 +70,11 @@ class NpcMarkerPublisher(Node):
         return (location.x, -location.y, location.z, -math.radians(rotation.yaw))
 
     def publish_markers(self):
+        world = self.link.world
+        if world is None:  # 尚未连上 CARLA (carla_link 后台重试中)
+            return
         try:
-            actors = self.world.get_actors()
+            actors = world.get_actors()
         except Exception as e:  # pylint: disable=broad-except
             self.get_logger().warn('get_actors 失败: %s' % e)
             return
