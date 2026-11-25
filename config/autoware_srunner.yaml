@@ -181,7 +181,13 @@ lifecycle:
     # 残留服务会让下一条 0.2s 就误判 e2e 就绪 (见 S_WAIT_E2E_GONE).
     e2e_gone_wait_s: 10.0
     # 新 e2e 至少运行 N 秒才认 routing 服务 (避开残留服务的 DDS 窗口).
-    e2e_ready_min_s: 5.0
+    e2e_ready_min_s: 50.0  # 实测 routing 服务就绪(约25s)仍早于 initial pose(约41s), 太早 execute 会让 AEB 立即判近距静止目标 -> MRM 刹住不动的 ego
+    # 诊断采集抑制窗 (秒): 以 e2e 就绪为基准, 这段时间内的 /diagnostics 不采集.
+    # 实测 e2e 起来后 0~8s 内 ekf_localizer 会因 pose 尚未到达 (pose_delay_time=nan)
+    # 与初始协方差椭圆偏大报 ERROR, 属启动瞬态; 不抑制会淹没 run_summary,
+    # 并可能经 diag 图分级误触发 MRM. 0 = 不抑制 (行为与加开关前一致).
+    # 15s 实测仍残留 lateral 椭圆 WARN (AUTONOMOUS 前 2.2s), 故取 20s 覆盖到接管后.
+    diag_collect_delay_s: 20.0
     rviz: true                    # 循环模式 e2e 每场景重启, rviz 常开会频繁重开窗口, 建议 false
 
 # ---------------- 传感器故障注入 (sensor_fault_injector 常驻节点) ----------------
