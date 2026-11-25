@@ -20,7 +20,10 @@
      manual: 队列执行完回 idle 常驻 (monitor 不退出), 等待 execute_batch
      指令 (需求 21 on_demand); 单个队列项出错记 ERROR 行后继续队列;
      仅 SIGINT/SIGTERM 时收尾退出;
-  9) 收到 SIGINT/SIGTERM (手动 Ctrl+C) 同样先杀子进程再销毁 actors 后退出.
+  9) 订阅 /diagnostics 聚合非 OK 诊断项 (name/level/message/key-value 快照),
+     既打 WARN 进 launch.log, 也并入 run_summary: MRM 急停的唯一判据就是
+     diag 图分级, 只有留下 key/value 才能自证"为什么被急停";
+ 10) 收到 SIGINT/SIGTERM (手动 Ctrl+C) 同样先杀子进程再销毁 actors 后退出.
 
 时序保证 (单线程状态机, 每 0.2s tick 一步, 全部步骤串行无竞态):
   起 e2e -> 路由服务就绪 -> e2e_up -> 起注入链 -> execute_scenario ->
@@ -48,6 +51,7 @@ from ament_index_python.packages import (get_package_prefix,
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from std_msgs.msg import String
 
 from autoware_adapi_v1_msgs.msg import MrmState
@@ -81,6 +85,17 @@ def _pdeathsig():
         pass
 
 
+def _diag_level(value):
+    """DiagnosticStatus.level 归一化为 int.
+
+    Humble 的 diagnostic_msgs/DiagnosticStatus.level 声明为 byte, Python 侧拿到
+    的是 bytes (b'\x02'), 直接比较会退化成字典序, 且无法 JSON 序列化。
+    """
+    if isinstance(value, bytes):
+        return int.from_bytes(value, 'little', signed=True)
+    return int(value)
+
+
 class ScenarioMonitor(Node):
     def __init__(self):
         super().__init__('scenario_monitor')
@@ -89,6 +104,7 @@ class ScenarioMonitor(Node):
         self.declare_parameter('e2e_ld_preload', '')
         self.declare_parameter('results_dir', '')
         self.declare_parameter('metrics_topic', '/carla/srunner/metrics')
+        self.declare_parameter('diagnostics_topic', '/diagnostics')
         # 3a: 编排控制参数 (launch 已按 CLI > yaml 覆盖语义解析为最终值,
         # 本节点不再回退 yaml; 直接 ros2 run 时为空则走都空报错)
         self.declare_parameter('scenario_root', '')
@@ -228,6 +244,21 @@ class ScenarioMonitor(Node):
         # finished 一律丢弃。
         self._sr_armed = False
         self._latest_metrics = {}
+        # 诊断聚合: name -> {level,message,values,count,first_ts,last_ts}
+        # MRM 急停/模式不可用的唯一判据是 diag 图分级, 但 logging_node 只打图路径,
+        # 不带 key/value; 这里保留最高级别那次的快照才能定位到具体 gate
+        self._diag = {}
+        self._diag_logged = {}   # name -> 已打日志的 level (同级不重复刷屏)
+        # 冷启动抑制窗: e2e 刚起来时 ekf 还没收到 pose (pose_delay_time=nan)、
+        # 初始协方差椭圆偏大, 会刷一批与场景无关的 ERROR; 这类噪声会淹没
+        # run_summary, 也会经 diag 图误触发 MRM. 以 e2e 就绪为基准延迟采集.
+        try:
+            self._diag_collect_delay_s = float(
+                self.cyc.get('diag_collect_delay_s', 15.0))
+        except (TypeError, ValueError):
+            self._diag_collect_delay_s = 15.0
+        self._diag_gate_open_ts = 0.0   # 开闸时刻 (monotonic); 0 = 本场景未开闸
+        self._diag_suppressed = 0       # 抑制窗内丢弃的诊断帧数 (可观测, 不静默)
         # 单条墙钟起点: run_summary/junit 的 per-case 时长 (仿真时长 ≠ 墙钟)
         self._scn_start_ts = None
         # 注入链夭折的条级处理 (不牵连整批): 见 S_WAIT_FINISH / S_NEXT
@@ -302,6 +333,10 @@ class ScenarioMonitor(Node):
         self.create_subscription(
             String, self.get_parameter('metrics_topic').value,
             self.on_metrics, fin_qos)
+        # /diagnostics 通道: 非 OK 诊断并入 run_summary (见 on_diagnostics)
+        self.create_subscription(
+            DiagnosticArray, self.get_parameter('diagnostics_topic').value,
+            self.on_diagnostics, 10)
         # 紧急制动信号 (MRM 状态机): 触发即取消轨迹注入
         if self.emergency_cancel_inject:
             self.create_subscription(
@@ -358,6 +393,77 @@ class ScenarioMonitor(Node):
             self._latest_metrics = json.loads(msg.data)
         except (TypeError, ValueError) as e:  # pylint: disable=broad-except
             self.get_logger().warn('metrics JSON 解析失败: %s' % e)
+
+    _DIAG_LEVEL_NAMES = {_diag_level(DiagnosticStatus.OK): 'OK',
+                         _diag_level(DiagnosticStatus.WARN): 'WARN',
+                         _diag_level(DiagnosticStatus.ERROR): 'ERROR',
+                         _diag_level(DiagnosticStatus.STALE): 'STALE'}
+    _DIAG_MAX_ITEMS = 100   # 单场景最多记多少条不同诊断项 (防爆量)
+    _DIAG_MAX_VALUES = 12   # 每条最多保留多少个 key/value
+
+    def on_diagnostics(self, msg):
+        """聚合非 OK 诊断 (WARN/ERROR/STALE): 打 launch.log + 供 run_summary 自证.
+
+        为什么需要: MRM 急停/模式不可用的唯一判据就是 diag 图分级
+        (diagnostic_graph_aggregator: available = level == OK), 而 logging_node
+        只打印图路径不带 key/value。实测 sensor_fusion_status WARN 触发急停时,
+        无法从日志判断是 pose 延时门/马氏门还是协方差椭圆越限, 只能重跑抓包。
+        这里按诊断 name 聚合, 保留最高级别那次的 message 与 key/value 快照。
+        """
+        # 抑制窗: 未开闸 (e2e 还没就绪) 或仍在延迟窗内则丢弃, 但要计数
+        if (self._diag_gate_open_ts == 0.0
+                or time.monotonic() < self._diag_gate_open_ts):
+            self._diag_suppressed += 1
+            return
+        for st in msg.status:
+            lvl = _diag_level(st.level)
+            if lvl < _diag_level(DiagnosticStatus.WARN):
+                continue
+            name = st.name or st.hardware_id or '<unnamed>'
+            ent = self._diag.get(name)
+            if ent is None:
+                if len(self._diag) >= self._DIAG_MAX_ITEMS:
+                    continue
+                ent = {
+                    'level': self._DIAG_LEVEL_NAMES.get(lvl, str(lvl)),
+                    'level_num': lvl, 'message': '', 'values': {},
+                    'count': 0, 'first_ts': round(time.time(), 3),
+                    'last_ts': 0.0,
+                }
+                self._diag[name] = ent
+            ent['count'] += 1
+            ent['last_ts'] = round(time.time(), 3)
+            # 只在首次见到该级或级别升级时刷新快照: 10Hz 重复帧会把启动期的
+            # 根因覆盖成最后一帧的噪声
+            if lvl > ent['level_num'] or (
+                    lvl == ent['level_num'] and not ent['message']):
+                ent['level'] = self._DIAG_LEVEL_NAMES.get(lvl, str(lvl))
+                ent['level_num'] = lvl
+                ent['message'] = str(st.message or '')[:200]
+                ent['values'] = {kv.key[:60]: str(kv.value or '')[:80]
+                                 for kv in st.values[:self._DIAG_MAX_VALUES]}
+            prev = self._diag_logged.get(name)
+            if prev is None or lvl > prev:
+                self._diag_logged[name] = lvl
+                kv = ' '.join('%s=%s' % it for it in ent['values'].items())
+                self.get_logger().warn(
+                    '[DIAG %s] %s: %s%s' % (ent['level'], name, ent['message'],
+                                            ('  ' + kv) if kv else ''))
+
+    def _diag_snapshot(self):
+        """当前场景诊断聚合的 JSON 可序列化快照 (并入 run_summary 用)."""
+        return {name: dict(ent) for name, ent in sorted(self._diag.items())}
+
+    def _diag_summary_line(self):
+        """单行摘要: 级别计数 + 前 3 个诊断名 (场景完成日志用)."""
+        if not self._diag:
+            return ''
+        errs = sum(1 for e in self._diag.values() if e['level'] == 'ERROR')
+        names = ', '.join(sorted(self._diag)[:3])
+        if len(self._diag) > 3:
+            names += ', ...'
+        return '%d 项 (ERROR %d / WARN+ %d): %s' % (
+            len(self._diag), errs, len(self._diag) - errs, names)
 
     def on_mrm_state(self, msg):
         """MRM 紧急制动触发 -> 取消轨迹注入 (替代 vehicle_cmd_gate 侧 hold 补丁).
@@ -521,6 +627,10 @@ class ScenarioMonitor(Node):
             self._item_error_reason = None
             self._inject_cancelled = False
             self._inject_cancel_signaled = False
+            self._diag = {}
+            self._diag_logged = {}
+            self._diag_gate_open_ts = 0.0   # e2e 就绪时重新开闸 (S_WAIT_E2E_READY)
+            self._diag_suppressed = 0
             scn = self._cur()
             self.get_logger().info('========== 场景 %d/%d: %s =========='
                                    % (self._batch_idx + 1, len(self._batch), scn['name']))
@@ -538,6 +648,11 @@ class ScenarioMonitor(Node):
                 return
             if self._routing_service_ready() and (
                     time.monotonic() - self._e2e_start_ts >= self._e2e_ready_min_s):
+                # e2e 就绪: 从这里起算抑制窗, 窗内诊断不采集
+                # (delay=0 时立即开闸, 行为与加开关前一致)
+                if self._diag_gate_open_ts == 0.0:
+                    self._diag_gate_open_ts = (time.monotonic()
+                                               + self._diag_collect_delay_s)
                 if self._inject_proc is None:
                     self._publish_cycle('e2e_up')
                     self._inject_proc = self._spawn_inject(self._cur()['file'])
@@ -618,6 +733,7 @@ class ScenarioMonitor(Node):
                     'verdict': verdict,
                     'criteria': criteria,
                     'metrics': dict(self._latest_metrics),
+                    'diagnostics': self._diag_snapshot(),
                     'wall_time_s': self._scn_wall_s(),
                 }
                 if scn.get('id'):
@@ -654,6 +770,13 @@ class ScenarioMonitor(Node):
                 else:
                     # 跑完一条 (无论通过/失败) 就打断"连续中止"计数
                     self._consecutive_item_errors = 0
+                if self._diag_suppressed:
+                    self.get_logger().info(
+                        '诊断采集跳过 %d 帧 (e2e 就绪后 %.1fs 冷启动窗)'
+                        % (self._diag_suppressed, self._diag_collect_delay_s))
+                diag_line = self._diag_summary_line()
+                if diag_line:
+                    self.get_logger().warn('本场景诊断异常: %s' % diag_line)
                 self.get_logger().info('场景完成 (result=%s, verdict=%s, wall=%.1fs): %s'
                                        % (self._finish_result, verdict,
                                           result_row['wall_time_s'], scn['file']))
@@ -859,6 +982,7 @@ class ScenarioMonitor(Node):
             'verdict': 'ERROR',
             'criteria': [],
             'metrics': dict(self._latest_metrics),
+            'diagnostics': self._diag_snapshot(),
             'wall_time_s': self._scn_wall_s(),
             'item_level_error': True,
             'abort_reason': reason,
@@ -1102,6 +1226,9 @@ class ScenarioMonitor(Node):
                 'fault_matrix': self.cyc.get('fault_matrix', ''),
                 'scenario_count': len(self.results),
                 'queue_total': len(self._batch),
+                # 采集抑制窗 (秒): 0 = 全量采集; >0 时 scenarios[].diagnostics
+                # 不含 e2e 就绪后这段时间内的冷启动噪声
+                'diagnostics_collect_delay_s': self._diag_collect_delay_s,
                 'output_dir': results_dir,
                 'abort_reason': self.abort_reason,
             },
@@ -1124,6 +1251,7 @@ class ScenarioMonitor(Node):
                     },
                     'verdict': {'result': r['verdict'], 'criteria': r['criteria']},
                     'metrics': r.get('metrics', {}),
+                    'diagnostics': r.get('diagnostics') or {},
                     'wall_time_s': r.get('wall_time_s', 0.0),
                     'fault': r.get('fault'),
                     'abort_reason': r.get('abort_reason'),
